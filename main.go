@@ -45,6 +45,7 @@ type Snapshot struct {
 	ProgressStagePercent int      `json:"progressStagePercent"`
 	ProgressStep         int      `json:"progressStep"`
 	ProgressTotal        int      `json:"progressTotal"`
+	CompletedStage       int      `json:"completedStage"`
 	ProgressDetail       string   `json:"progressDetail,omitempty"`
 	GatewayRunning       bool     `json:"gatewayRunning"`
 	MemoryBackend        string   `json:"memoryBackend"`
@@ -63,6 +64,8 @@ type app struct {
 	serverURL        string
 	gateway          *exec.Cmd
 	gatewayLog       *os.File
+	gatewayStopped   *exec.Cmd // gateway process we deliberately stopped
+	llama            llamaState
 	ctx              context.Context
 	cancel           context.CancelFunc
 	resumeSetup      bool
@@ -96,6 +99,12 @@ func main() {
 		log.Fatal(err)
 	}
 	a.serverURL = "http://" + listener.Addr().String()
+	// Publish the (random) loopback address so tools can probe /api/state.
+	urlFile := filepath.Join(dataDir, "server.url")
+	if err := os.WriteFile(urlFile, []byte(a.serverURL+"\n"), 0600); err != nil {
+		log.Printf("%s could not write %s: %v", productName, urlFile, err)
+	}
+	defer os.Remove(urlFile)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/state", a.handleState)
@@ -140,6 +149,7 @@ func main() {
 	shutdownCancel()
 	a.cancel()
 	a.stopGateway()
+	a.stopLlama()
 	if a.gatewayLog != nil {
 		_ = a.gatewayLog.Close()
 	}
@@ -231,7 +241,51 @@ func (a *app) handleState(w http.ResponseWriter, r *http.Request) {
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	writeJSON(w, a.state)
+	_, entryErr := a.openclawEntry()
+	writeJSON(w, struct {
+		Snapshot
+		Runtime runtimeStatus `json:"runtime"`
+	}{a.state, runtimeStatus{
+		PID:             os.Getpid(),
+		Executable:      executablePath(),
+		DataDir:         a.dataDir,
+		RuntimeDir:      a.runtimeDir(),
+		NodeInstalled:   isFile(a.nodeExe()),
+		OpenClawReady:   entryErr == nil,
+		GatewayPID:      a.gatewayPID(),
+		LlamaBackend:    a.llamaBackendName(),
+		StateSavedAtUTC: time.Now().UTC().Format(time.RFC3339),
+	}})
+}
+
+// runtimeStatus describes the running process and its private runtime, for
+// diagnostics via /api/state.
+type runtimeStatus struct {
+	PID             int    `json:"pid"`
+	Executable      string `json:"executable"`
+	DataDir         string `json:"dataDir"`
+	RuntimeDir      string `json:"runtimeDir"`
+	NodeInstalled   bool   `json:"nodeInstalled"`
+	OpenClawReady   bool   `json:"openclawReady"`
+	GatewayPID      int    `json:"gatewayPid"`
+	LlamaBackend    string `json:"llamaBackend"`
+	StateSavedAtUTC string `json:"time"`
+}
+
+func executablePath() string {
+	path, err := os.Executable()
+	if err != nil {
+		return ""
+	}
+	return path
+}
+
+// gatewayPID must be called with a.mu held.
+func (a *app) gatewayPID() int {
+	if a.gateway != nil && a.gateway.Process != nil {
+		return a.gateway.Process.Pid
+	}
+	return 0
 }
 
 func (a *app) handleSetup(w http.ResponseWriter, r *http.Request) {
@@ -318,10 +372,25 @@ func (a *app) handleInstall(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "finish the first-run profile first", http.StatusConflict)
 		return
 	}
-	if a.state.SetupRunning || a.state.SetupComplete {
+	// ?from=N re-runs setup starting at stage N (1-10), even after completion.
+	from, hasFrom := 0, false
+	if v := r.URL.Query().Get("from"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 1 || n > 10 {
+			a.mu.Unlock()
+			http.Error(w, "from must be a stage number from 1 to 10", http.StatusBadRequest)
+			return
+		}
+		from, hasFrom = n, true
+	}
+	if a.state.SetupRunning || (a.state.SetupComplete && !hasFrom) {
 		a.mu.Unlock()
 		http.Error(w, "setup is already running or complete", http.StatusConflict)
 		return
+	}
+	if hasFrom {
+		a.state.SetupComplete = false
+		a.state.CompletedStage = min(from-1, lastResumableStage)
 	}
 	a.beginSetupLocked()
 	_ = a.persistLocked()
@@ -336,7 +405,7 @@ func (a *app) beginSetupLocked() {
 	a.state.ProgressPercent = 0
 	a.state.ProgressStagePercent = 0
 	a.state.ProgressStep = 0
-	a.state.ProgressTotal = 9
+	a.state.ProgressTotal = 10
 	a.state.ProgressDetail = "Preparing automatic setup"
 	a.state.Step = "Starting Sovereign AI setup"
 	a.logLocked("Starting automatic OpenClaw and local model setup")
@@ -369,7 +438,7 @@ func (a *app) bootstrap() {
 		a.fail(err)
 		return
 	}
-	const total = 9
+	const total = 10
 	if err := a.runSetupStage(1, total, "Installing a private Node.js runtime and OpenClaw", func() error {
 		if err := os.MkdirAll(a.runtimeDir(), 0700); err != nil {
 			return err
@@ -382,67 +451,82 @@ func (a *app) bootstrap() {
 		a.fail(fmt.Errorf("OpenClaw install failed: %w", err))
 		return
 	}
-	if err := a.runSetupStage(2, total, "Preparing OpenClaw workspace and local memory settings", func() error {
-		steps := [][]string{
-			{"config", "set", "agents.defaults.workspace", a.workspace},
-			{"config", "set", "memory.search.provider", "local"},
-			{"config", "set", "memory.search.fallback", "none"},
-		}
-		for _, args := range steps {
-			if err := a.runOpenClaw(args...); err != nil {
-				return fmt.Errorf("OpenClaw command %q failed: %w", strings.Join(args, " "), err)
-			}
+	if err := a.runSetupStage(2, total, "Preparing the OpenClaw workspace", func() error {
+		if err := a.runOpenClaw("config", "set", "agents.defaults.workspace", a.workspace); err != nil {
+			return fmt.Errorf("setting the OpenClaw workspace failed: %w", err)
 		}
 		return nil
 	}); err != nil {
 		a.fail(err)
 		return
 	}
-	if err := a.runSetupStage(3, total, "Installing the local llama.cpp provider", func() error {
-		return a.runOpenClaw("plugins", "install", "@openclaw/llama-cpp-provider", "--pin")
+	if err := a.runSetupStage(3, total, "Installing the OpenClaw llama.cpp provider", func() error {
+		return a.runOpenClaw("plugins", "install", "clawhub:@openclaw/llama-cpp-provider", "--force")
 	}); err != nil {
 		a.fail(fmt.Errorf("installing the local model provider failed: %w", err))
 		return
 	}
-	modelSpec := `[{"id":"agents-a1-4b-q4-k-m","name":"Agents-A1 4B Q4_K_M","reasoning":false,"input":["text"],"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0},"contextWindow":16384,"maxTokens":4096,"params":{"modelPath":"hf:InternScience/Agents-A1-4B-Q4_K_M-GGUF/Agents-A1-4B-Q4_K_M.gguf","contextSize":16384},"compat":{"supportsTools":true}}]`
-	if err := a.runSetupStage(4, total, "Registering Agents-A1 4B from Hugging Face", func() error {
-		if err := a.runOpenClaw("config", "set", "models.providers.llama-cpp.models", modelSpec, "--strict-json", "--merge"); err != nil {
-			return fmt.Errorf("registering Agents-A1 4B failed: %w", err)
+	if err := a.runSetupStage(4, total, "Downloading the llama.cpp runtime for this GPU", func() error {
+		var failures []string
+		for _, backend := range a.backendCandidates() {
+			if _, err := a.ensureBackend(backend); err != nil {
+				failures = append(failures, backend+": "+err.Error())
+				continue
+			}
+			return nil
 		}
-		if err := a.runOpenClaw("models", "set", "llama-cpp/agents-a1-4b-q4-k-m"); err != nil {
-			return fmt.Errorf("selecting Agents-A1 4B failed: %w", err)
-		}
-		return nil
+		return errors.New(strings.Join(failures, "; "))
 	}); err != nil {
-		a.fail(err)
+		a.fail(fmt.Errorf("llama.cpp runtime setup failed: %w", err))
 		return
 	}
-	if err := a.runSetupStage(5, total, "Downloading Agents-A1 4B and the managed llama.cpp runtime", func() error {
-		return a.runOpenClaw("models", "auth", "login", "--provider", "llama-cpp", "--method", "local")
+	if err := a.runSetupStage(5, total, "Downloading Agents-A1 4B from Hugging Face", func() error {
+		return a.ensureModel(chatRepo, chatFile, a.chatModel())
+	}); err != nil {
+		a.fail(fmt.Errorf("downloading Agents-A1 4B failed: %w", err))
+		return
+	}
+	if err := a.runSetupStage(6, total, "Downloading the local memory embedding model", func() error {
+		return a.ensureModel(embedRepo, embedFile, a.embedModel())
+	}); err != nil {
+		a.fail(fmt.Errorf("downloading the embedding model failed: %w", err))
+		return
+	}
+	if err := a.runSetupStage(7, total, "Starting the local model servers and connecting OpenClaw", func() error {
+		if err := a.startLlama(); err != nil {
+			return err
+		}
+		return a.registerLocalModels()
 	}); err != nil {
 		a.fail(fmt.Errorf("local model setup failed: %w", err))
 		return
 	}
-	if err := a.runSetupStage(6, total, "Downloading and configuring local memory embeddings", func() error {
-		return a.runOpenClaw("onboard", "--non-interactive", "--accept-risk", "--auth-choice", "llama-cpp", "--llama-cpp-embedding-only")
-	}); err != nil {
-		a.fail(fmt.Errorf("local embeddings setup failed: %w", err))
-		return
-	}
-	if err := a.runSetupStage(7, total, "Indexing the local profile and memory files", func() error {
+	if err := a.runSetupStage(8, total, "Indexing the local profile and memory files", func() error {
 		return a.runOpenClaw("memory", "index", "--force")
 	}); err != nil {
 		a.fail(fmt.Errorf("memory indexing failed: %w", err))
 		return
 	}
-	if err := a.runSetupStage(8, total, "Saving the assistant persona", func() error {
+	if err := a.runSetupStage(9, total, "Saving the assistant persona", func() error {
 		return a.writePersona(a.profile())
 	}); err != nil {
 		a.fail(fmt.Errorf("saving persona files failed: %w", err))
 		return
 	}
-	if err := a.runSetupStage(9, total, "Starting the OpenClaw Gateway", func() error {
-		return a.startGateway()
+	if err := a.runSetupStage(10, total, "Starting the OpenClaw Gateway", func() error {
+		if err := a.startGateway(); err != nil {
+			return err
+		}
+		// Make sure the Gateway survives startup rather than exiting on a config error.
+		for deadline := time.Now().Add(10 * time.Second); time.Now().Before(deadline); time.Sleep(500 * time.Millisecond) {
+			a.mu.Lock()
+			alive := a.gateway != nil
+			a.mu.Unlock()
+			if !alive {
+				return fmt.Errorf("the OpenClaw Gateway exited during startup: %s", tailFile(filepath.Join(a.dataDir, "gateway.log"), 800))
+			}
+		}
+		return nil
 	}); err != nil {
 		a.fail(err)
 		return
@@ -461,10 +545,30 @@ func (a *app) bootstrap() {
 	a.mu.Unlock()
 }
 
+// lastResumableStage is the last stage whose work is a one-time install or
+// download. Stages after it (start servers, register, index, persona, gateway)
+// are cheap and depend on runtime state, so they run on every pass.
+const lastResumableStage = 6
+
 func (a *app) runSetupStage(index, total int, name string, action func() error) error {
+	a.mu.Lock()
+	done := index <= lastResumableStage && index <= a.state.CompletedStage
+	a.mu.Unlock()
+	if done {
+		a.mu.Lock()
+		a.logLocked("Already done, skipping: " + name)
+		a.mu.Unlock()
+		a.completeSetupStage(index, total)
+		return nil
+	}
 	a.setSetupStage(index, total, name)
 	if err := action(); err != nil {
 		return err
+	}
+	if index <= lastResumableStage {
+		a.mu.Lock()
+		a.state.CompletedStage = index
+		a.mu.Unlock()
 	}
 	a.completeSetupStage(index, total)
 	return nil
@@ -511,7 +615,7 @@ func setEnvValue(env []string, name, value string) []string {
 }
 
 func (a *app) downloadFile(source, destination, label string) error {
-	requestCtx, cancel := context.WithTimeout(a.ctx, 20*time.Minute)
+	requestCtx, cancel := context.WithTimeout(a.ctx, 4*time.Hour)
 	defer cancel()
 	request, err := http.NewRequestWithContext(requestCtx, http.MethodGet, source, nil)
 	if err != nil {
@@ -778,6 +882,16 @@ func (a *app) completeSetupStage(index, total int) {
 	a.mu.Unlock()
 }
 
+func (a *app) setStageActivity(detail string) {
+	a.mu.Lock()
+	a.stagePercent = 0
+	a.state.ProgressStagePercent = 0
+	a.state.ProgressDetail = detail
+	a.logLocked(detail)
+	_ = a.persistLocked()
+	a.mu.Unlock()
+}
+
 func (a *app) recordCommandOutput(line string) {
 	a.mu.Lock()
 	if a.state.SetupRunning {
@@ -854,6 +968,9 @@ func (a *app) handleStart(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *app) startGateway() error {
+	if err := a.startLlama(); err != nil {
+		return fmt.Errorf("start local model servers: %w", err)
+	}
 	a.mu.Lock()
 	if a.gateway != nil && a.gateway.Process != nil {
 		a.state.GatewayRunning = true
@@ -892,7 +1009,10 @@ func (a *app) startGateway() error {
 		if a.gateway == cmd {
 			a.gateway = nil
 			a.state.GatewayRunning = false
-			if err != nil && a.ctx.Err() == nil {
+			if a.gatewayStopped == cmd {
+				a.gatewayStopped = nil
+				a.logLocked("OpenClaw Gateway stopped")
+			} else if err != nil && a.ctx.Err() == nil {
 				a.state.Error = "Gateway exited: " + err.Error()
 				a.logLocked(a.state.Error)
 			} else {
@@ -908,6 +1028,7 @@ func (a *app) startGateway() error {
 func (a *app) stopGateway() {
 	a.mu.Lock()
 	cmd := a.gateway
+	a.gatewayStopped = cmd
 	a.mu.Unlock()
 	if cmd != nil && cmd.Process != nil {
 		if runtime.GOOS == "windows" {
@@ -1024,20 +1145,20 @@ func (a *app) configureMemory(backend string) {
 	switch backend {
 	case "memory-core":
 		add("Selecting OpenClaw memory-core", "config", "set", "plugins.slots.memory", "memory-core")
-		add("Keeping local embeddings enabled", "config", "set", "memory.search.provider", "local")
+		add("Keeping the local embedding server in use", "config", "set", "memory.search.provider", "openai")
 		add("Refreshing the local memory index", "memory", "index", "--force")
 	case "honcho":
 		add("Keeping OpenClaw memory-core active alongside Honcho", "config", "set", "plugins.slots.memory", "memory-core")
-		add("Installing the Honcho memory plug-in", "plugins", "install", "@honcho-ai/openclaw-honcho", "--pin", "--force")
+		add("Installing the Honcho memory plug-in", "plugins", "install", "clawhub:@honcho-ai/openclaw-honcho", "--force")
 		add("Starting Honcho setup", "honcho", "setup")
 	case "memory-lancedb":
-		add("Installing the LanceDB memory plug-in", "plugins", "install", "@openclaw/memory-lancedb", "--pin", "--no-enable")
-		localConfig := `{"embedding":{"provider":"local"},"autoRecall":true,"autoCapture":true}`
-		add("Configuring LanceDB to use local embeddings", "config", "set", "plugins.entries.memory-lancedb.config", localConfig, "--strict-json", "--merge")
+		add("Installing the LanceDB memory plug-in", "plugins", "install", "clawhub:@openclaw/memory-lancedb", "--force", "--no-enable")
+		localConfig := fmt.Sprintf(`{"embedding":{"provider":"openai","baseUrl":"http://127.0.0.1:%d/v1","apiKey":"llama-cpp-local","model":%q,"dimensions":768},"autoRecall":true,"autoCapture":true}`, llamaEmbedPort, embedModelID)
+		add("Configuring LanceDB to use the local embedding server", "config", "set", "plugins.entries.memory-lancedb.config", localConfig, "--strict-json", "--merge")
 		add("Activating LanceDB memory", "plugins", "enable", "memory-lancedb")
 		add("Selecting LanceDB as the active memory store", "config", "set", "plugins.slots.memory", "memory-lancedb")
 	case "mem0":
-		add("Installing the Mem0 memory plug-in", "plugins", "install", "@mem0/openclaw-mem0", "--pin", "--force")
+		add("Installing the Mem0 memory plug-in", "plugins", "install", "clawhub:@mem0/openclaw-mem0", "--force")
 		add("Starting the Mem0 local or hosted setup wizard", "mem0", "init", "--mode", "open-source")
 		add("Selecting Mem0 as the active memory store", "config", "set", "plugins.slots.memory", "openclaw-mem0")
 	}

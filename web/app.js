@@ -73,37 +73,13 @@ function render(snapshot) {
   $("#agent-title").textContent = snapshot.profile.agentName || "Sovereign AI";
   $("#persona-summary").textContent = `${snapshot.profile.agentName || "Sovereign AI"} knows how you like to work`;
   $("#purpose-summary").textContent = snapshot.profile.purpose || "Your assistant is ready for its first conversation.";
-  const memoryBackend = snapshot.memoryBackend || "memory-core";
-  const memoryNames = {
-    "memory-core": "OpenClaw memory-core",
-    "memory-core + Honcho": "memory-core + Honcho",
-    "memory-lancedb": "OpenClaw LanceDB",
-    "openclaw-mem0": "OpenClaw Mem0",
-  };
-  const memoryDescriptions = {
-    "memory-core": "OpenClaw memory-core indexes your profile and notes with local embeddings.",
-    "memory-core + Honcho": "Local memory-core stays active alongside Honcho persona and conversation memory.",
-    "memory-lancedb": "LanceDB is the active vector store and uses OpenClaw's managed local embeddings.",
-    "openclaw-mem0": "Mem0 is the active memory provider. Its data location depends on the providers chosen during setup.",
-  };
-  $("#memory-current-name").textContent = memoryNames[memoryBackend] || memoryBackend;
-  $("#memory-summary").textContent = memoryDescriptions[memoryBackend] || "OpenClaw memory provider is configured.";
-  $("#memory-location").textContent = memoryBackend === "memory-core" || memoryBackend === "memory-lancedb" ? "ON DEVICE" : memoryBackend === "memory-core + Honcho" ? "CORE + HONCHO" : "CONFIGURED";
-  $("#memory-mode").textContent = memoryBackend === "memory-core" || memoryBackend === "memory-lancedb" ? "ON DEVICE" : memoryBackend === "memory-core + Honcho" ? "LOCAL + SERVICE" : "CONFIGURED";
-  for (const button of document.querySelectorAll(".memory-choice")) {
-    const target = button.dataset.memory;
-    const active = target === memoryBackend || (target === "memory-core" && memoryBackend === "memory-core + Honcho");
-    button.classList.toggle("selected", active);
-    button.setAttribute("aria-pressed", String(active));
-    button.disabled = snapshot.memoryRunning || snapshot.setupRunning;
-  }
   $("#gateway-status").textContent = snapshot.gatewayRunning ? "Running" : "Stopped";
-  $("#gateway-detail").textContent = snapshot.gatewayRunning ? "Local OpenClaw Gateway" : "Ready when you are";
+  $("#gateway-detail").textContent = snapshot.gatewayRunning ? "Running on this computer" : "Ready when you are";
   $("#gateway-dot").classList.toggle("running", snapshot.gatewayRunning);
   $("#start-button").disabled = snapshot.gatewayRunning;
   $("#stop-button").disabled = !snapshot.gatewayRunning;
   $("#overall-status").classList.toggle("online", snapshot.gatewayRunning);
-  $("#overall-status b").textContent = snapshot.gatewayRunning ? "Agent running" : "Agent stopped";
+  $("#overall-status b").textContent = snapshot.gatewayRunning ? "Assistant is awake" : "Assistant is asleep";
   $("#step-title").textContent = snapshot.step || "Ready";
   $("#activity-state").textContent = snapshot.setupRunning || snapshot.memoryRunning ? "In progress" : snapshot.error ? "Needs attention" : "Updated";
   $("#activity-state").classList.toggle("attention", Boolean(snapshot.error));
@@ -153,18 +129,5 @@ $("#start-button").addEventListener("click", async () => { try { await api("/api
 $("#stop-button").addEventListener("click", async () => { try { await api("/api/stop", { method: "POST", body: "{}" }); await refresh(); } catch (e) { showError($("#error-box"), e.message); } });
 $("#chat-button").addEventListener("click", async () => { try { await api("/api/openclaw", { method: "POST", body: "{}" }); } catch (e) { showError($("#error-box"), e.message); } });
 $("#workspace-link").addEventListener("click", async (event) => { event.preventDefault(); try { await api("/api/workspace", { method: "POST", body: "{}" }); } catch (e) { showError($("#error-box"), e.message); } });
-for (const button of document.querySelectorAll(".memory-choice")) {
-  button.addEventListener("click", async () => {
-    button.disabled = true;
-    try {
-      await api("/api/memory", { method: "POST", body: JSON.stringify({ backend: button.dataset.memory }) });
-      await refresh();
-    } catch (error) {
-      showError($("#error-box"), error.message);
-      button.disabled = false;
-    }
-  });
-}
-
 refresh();
 setInterval(refresh, 1500);

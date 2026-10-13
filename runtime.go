@@ -15,6 +15,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // The app's dependency chain lives entirely under <dataDir>/runtime and is
@@ -26,7 +27,7 @@ import (
 //	runtime/npm-cache  npm cache
 //	runtime/home       OPENCLAW_HOME: OpenClaw state, models, llama.cpp runtime
 
-const minNodeMajor = 22
+const minNodeMajor = 26
 
 func (a *app) runtimeDir() string  { return filepath.Join(a.dataDir, "runtime") }
 func (a *app) nodeDir() string     { return filepath.Join(a.runtimeDir(), "node") }
@@ -65,9 +66,13 @@ func (a *app) openclawEntry() (string, error) {
 }
 
 // runtimeEnv is the environment for every child process: the inherited
-// environment with the private Node first on PATH and all tool state redirected
-// into the app's data directory. PSModulePath is dropped so a PowerShell 7
-// parent cannot break Windows PowerShell children.
+// environment with PATH replaced by a minimal private one (the private Node,
+// the openclaw .bin dir and the Windows system directories) and all tool state
+// redirected into the app's data directory. The user's own PATH is deliberately
+// not inherited: on machines with a long PATH, npm hands lifecycle scripts an
+// empty PATH and package install scripts then fail to find `node`.
+// PSModulePath is dropped so a PowerShell 7 parent cannot break Windows
+// PowerShell children.
 func (a *app) runtimeEnv() []string {
 	env := make([]string, 0, len(os.Environ())+8)
 	for _, entry := range os.Environ() {
@@ -76,8 +81,17 @@ func (a *app) runtimeEnv() []string {
 		}
 		env = append(env, entry)
 	}
-	env = prependPath(env, filepath.Join(a.openclawDir(), "node_modules", ".bin"))
-	env = prependPath(env, a.nodeDir())
+	systemRoot := envValue(env, "SystemRoot")
+	if systemRoot == "" {
+		systemRoot = `C:\Windows`
+	}
+	env = setEnvValue(env, "Path", strings.Join([]string{
+		a.nodeDir(),
+		filepath.Join(a.openclawDir(), "node_modules", ".bin"),
+		filepath.Join(systemRoot, "System32"),
+		systemRoot,
+		filepath.Join(systemRoot, "System32", "Wbem"),
+	}, string(os.PathListSeparator)))
 	env = setEnvValue(env, "OPENCLAW_HOME", filepath.Join(a.runtimeDir(), "home"))
 	env = setEnvValue(env, "npm_config_cache", filepath.Join(a.runtimeDir(), "npm-cache"))
 	env = setEnvValue(env, "npm_config_prefix", a.openclawDir())
@@ -116,31 +130,47 @@ func (a *app) httpGet(url string) (*http.Response, error) {
 	return response, nil
 }
 
-// latestNodeLTS returns the newest LTS release (e.g. "v22.11.0") whose major
-// version is at least minNodeMajor.
-func (a *app) latestNodeLTS() (string, error) {
+// latestNodeRelease returns the newest Node 26 release with an archive for
+// this Windows architecture. OpenClaw's installer currently requires Node 26.1+
+// or Node 24.16+ with a compatible SQLite build.
+func (a *app) latestNodeRelease(platform string) (string, error) {
 	response, err := a.httpGet("https://nodejs.org/dist/index.json")
 	if err != nil {
 		return "", fmt.Errorf("look up Node.js releases: %w", err)
 	}
 	defer response.Body.Close()
 	var releases []struct {
-		Version string `json:"version"`
-		LTS     any    `json:"lts"`
+		Version string   `json:"version"`
+		Files   []string `json:"files"`
 	}
 	if err := json.NewDecoder(response.Body).Decode(&releases); err != nil {
 		return "", fmt.Errorf("read Node.js release index: %w", err)
 	}
+	wantedFile := platform + "-zip"
 	for _, release := range releases { // newest first
-		if lts, ok := release.LTS.(string); !ok || lts == "" {
+		if !strings.HasPrefix(release.Version, "v26.") || !isOpenClawNodeVersion(release.Version) {
 			continue
 		}
-		major, _, _ := strings.Cut(strings.TrimPrefix(release.Version, "v"), ".")
-		if n, err := strconv.Atoi(major); err == nil && n >= minNodeMajor {
-			return release.Version, nil
+		for _, file := range release.Files {
+			if file == wantedFile {
+				return release.Version, nil
+			}
 		}
 	}
-	return "", errors.New("no suitable Node.js LTS release found")
+	return "", fmt.Errorf("no supported Node.js 26 archive found for %s", platform)
+}
+
+func isOpenClawNodeVersion(version string) bool {
+	parts := strings.Split(strings.TrimPrefix(version, "v"), ".")
+	if len(parts) < 2 {
+		return false
+	}
+	major, majorErr := strconv.Atoi(parts[0])
+	minor, minorErr := strconv.Atoi(parts[1])
+	if majorErr != nil || minorErr != nil {
+		return false
+	}
+	return (major == 24 && minor >= 16) || (major == minNodeMajor && minor >= 1) || major > minNodeMajor
 }
 
 func (a *app) expectedSHA256(version, file string) (string, error) {
@@ -155,7 +185,7 @@ func (a *app) expectedSHA256(version, file string) (string, error) {
 	}
 	for _, line := range strings.Split(string(body), "\n") {
 		fields := strings.Fields(line)
-		if len(fields) == 2 && fields[1] == file {
+		if len(fields) == 2 && strings.TrimPrefix(fields[1], "*") == file {
 			return strings.ToLower(fields[0]), nil
 		}
 	}
@@ -178,14 +208,14 @@ func fileSHA256(path string) (string, error) {
 // ensureNode downloads, verifies and unpacks a portable Node.js if one is not
 // already present in the private runtime.
 func (a *app) ensureNode() error {
-	if isFile(a.nodeExe()) && isFile(a.npmCLI()) {
+	if isFile(a.npmCLI()) && a.nodeRuntimeReady(a.nodeExe()) {
 		return nil
 	}
 	platform, err := nodePlatform()
 	if err != nil {
 		return err
 	}
-	version, err := a.latestNodeLTS()
+	version, err := a.latestNodeRelease(platform)
 	if err != nil {
 		return err
 	}
@@ -212,12 +242,59 @@ func (a *app) ensureNode() error {
 		_ = os.RemoveAll(staging)
 		return fmt.Errorf("unpack Node.js: %w", err)
 	}
-	_ = os.RemoveAll(a.nodeDir())
-	if err := os.Rename(staging, a.nodeDir()); err != nil {
+	if !a.nodeRuntimeReady(filepath.Join(staging, "node.exe")) {
+		_ = os.RemoveAll(staging)
+		return errors.New("downloaded Node.js runtime does not meet OpenClaw's version and SQLite requirements")
+	}
+	if err := a.retryFS("remove the previous Node.js runtime", func() error { return os.RemoveAll(a.nodeDir()) }); err != nil {
+		return err
+	}
+	if err := a.retryFS("activate the Node.js runtime", func() error { return os.Rename(staging, a.nodeDir()) }); err != nil {
 		return err
 	}
 	a.recordCommandOutput("Node.js " + version + " ready in the private runtime")
 	return nil
+}
+
+// retryFS retries a filesystem operation for up to ~30s. On Windows, antivirus
+// or the indexer commonly holds handles on freshly extracted or just-executed
+// binaries, which makes remove/rename fail transiently with "Access is denied".
+func (a *app) retryFS(what string, op func() error) error {
+	var err error
+	for attempt := 0; attempt < 30; attempt++ {
+		if err = op(); err == nil {
+			return nil
+		}
+		select {
+		case <-a.ctx.Done():
+			return a.ctx.Err()
+		case <-time.After(time.Second):
+		}
+	}
+	return fmt.Errorf("%s (is antivirus or another process holding files in %s?): %w", what, a.runtimeDir(), err)
+}
+
+func (a *app) nodeRuntimeReady(nodeExe string) bool {
+	versionOutput, err := exec.CommandContext(a.ctx, nodeExe, "--version").Output()
+	if err != nil || !isOpenClawNodeVersion(strings.TrimSpace(string(versionOutput))) {
+		return false
+	}
+	const probeScript = `const result={available:false,text:false,blob:false,json:false};let db;try{const{DatabaseSync}=require("node:sqlite");db=new DatabaseSync(":memory:");result.available=true;const text="a\u0000b\u0000";const bytes=Buffer.from(text,"utf8");const json=JSON.stringify({value:text});db.exec("CREATE TABLE probe (text_value TEXT, blob_value BLOB, json_value TEXT)");db.prepare("INSERT INTO probe VALUES (?, ?, ?)").run(text,bytes,json);const row=db.prepare("SELECT text_value, blob_value, json_value FROM probe").get();result.text=typeof row?.text_value==="string"&&row.text_value.length===text.length&&Buffer.from(row.text_value,"utf8").equals(bytes);result.blob=row?.blob_value instanceof Uint8Array&&Buffer.from(row.blob_value).equals(bytes);result.json=row?.json_value===json&&JSON.parse(row.json_value).value===text;}catch(error){result.error=error instanceof Error?error.message:String(error);}finally{db?.close();}process.stdout.write(JSON.stringify(result));`
+	probeOutput, err := exec.CommandContext(a.ctx, nodeExe, "-e", probeScript).Output()
+	if err != nil {
+		return false
+	}
+	var probe struct {
+		Available bool   `json:"available"`
+		Text      bool   `json:"text"`
+		Blob      bool   `json:"blob"`
+		JSON      bool   `json:"json"`
+		Error     string `json:"error"`
+	}
+	if err := json.Unmarshal(probeOutput, &probe); err != nil {
+		return false
+	}
+	return probe.Available && probe.Text && probe.Blob && probe.JSON && probe.Error == ""
 }
 
 // extractZipStrip unpacks a zip into dest, dropping the single top-level
@@ -276,6 +353,18 @@ func (a *app) ensureOpenClaw() error {
 	if _, err := a.openclawEntry(); err == nil {
 		return nil
 	}
+	a.setStageActivity("Installing OpenClaw and its dependencies")
+	pathCheck := exec.CommandContext(a.ctx, "cmd.exe", "/d", "/s", "/c", "node --version")
+	pathCheck.Env = a.runtimeEnv()
+	pathCheck.Dir = a.runtimeDir()
+	pathOutput, err := pathCheck.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("Windows package scripts cannot resolve the private Node.js runtime: %s: %w", strings.TrimSpace(string(pathOutput)), err)
+	}
+	if !isOpenClawNodeVersion(strings.TrimSpace(string(pathOutput))) {
+		return fmt.Errorf("Windows package scripts resolved an unsupported Node.js version: %s", strings.TrimSpace(string(pathOutput)))
+	}
+	a.recordCommandOutput("Windows package-script Node.js lookup passed: " + strings.TrimSpace(string(pathOutput)))
 	if err := os.MkdirAll(a.openclawDir(), 0700); err != nil {
 		return err
 	}
@@ -283,7 +372,7 @@ func (a *app) ensureOpenClaw() error {
 	if err := a.runCommand(cmd); err != nil {
 		return fmt.Errorf("npm install openclaw failed: %w", err)
 	}
-	_, err := a.openclawEntry()
+	_, err = a.openclawEntry()
 	return err
 }
 
