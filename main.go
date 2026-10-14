@@ -1169,7 +1169,7 @@ func openBrowser(address string) {
 // vendored scripts, and the JSON API.
 func publicPath(p string) bool {
 	switch p {
-	case "/", "/style.css", "/dashboard.css", "/app.js", "/orb.js", "/neuron.js", "/voice.js", "/vad.js", "/stt.js", "/stt-worker.js", "/listen.js", "/capture-worklet.js", "/favicon.ico":
+	case "/", "/style.css", "/dashboard.css", "/app.js", "/orb.js", "/neuron.js", "/hud.js", "/voice.js", "/vad.js", "/stt.js", "/stt-worker.js", "/listen.js", "/capture-worklet.js", "/favicon.ico":
 		return true
 	}
 	return strings.HasPrefix(p, "/api/") || strings.HasPrefix(p, "/vendor/") || strings.HasPrefix(p, "/models/whistle/")

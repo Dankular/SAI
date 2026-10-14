@@ -82,6 +82,7 @@ function render(snapshot) {
   }
 
   reveal("dashboard");
+  ensureHud();
   $("#welcome-name").textContent = snapshot.profile.userName || "there";
   // The process manager (snapshot.agent) is the only source of truth for what the assistant is
   // doing; nothing in this page decides it, so every tab agrees.
@@ -217,6 +218,7 @@ function applyOrb() {
     }
   }
   if (wanted !== shownState) { shownState = wanted; shownAt = performance.now(); }
+  document.body.dataset.orb = wanted; // the HUD frames take the state's colour from this
   const state = shownState;
   const stage = $(".orb-stage");
   if (stage) stage.dataset.state = state;
@@ -598,3 +600,23 @@ try { if (localStorage.getItem("sai-terminal") === "1") setTerminal(true); } cat
 
 refresh();
 setInterval(refresh, 1500);
+
+
+// ---- HUD frames around the panels --------------------------------------------
+// Each panel gets a procedurally drawn sci-fi frame (hud.js). The seed is fixed per panel so the
+// shapes are stable between visits; the colour follows the assistant's state through CSS.
+let hudStarted = false;
+async function ensureHud() {
+  if (hudStarted) return;
+  hudStarted = true;
+  try {
+    const { frame } = await import("/hud.js");
+    const pad = window.innerWidth < 700 ? 8 : 14; // outsets must fit in the page margin
+    const panels = [[".stage", { seed: HUD_SEEDS.stage, pad }], [".convo", { seed: HUD_SEEDS.convo, pad }], ["#terminal-panel", { seed: HUD_SEEDS.terminal, pad: 6, maxChamferPx: 14 }]];
+    for (const [selector, options] of panels) {
+      const el = $(selector);
+      if (el) frame(el, options);
+    }
+  } catch (error) { console.warn("HUD frames unavailable", error); }
+}
+const HUD_SEEDS = { stage: 898766, convo: 31337, terminal: 2024 };

@@ -230,3 +230,17 @@ body.is-dashboard .topbar{flex:none;height:54px}
   68%{transform:translate(1px,0)}
 }
 @media (prefers-reduced-motion:reduce){.glitch,.glitch::before,.glitch::after{animation:none}.glitch::before,.glitch::after{display:none}}
+
+/* ===== HUD frames (hud.js) ===== */
+:root{--hud:#5fd8e8}
+body[data-orb="idle"]{--hud:#7d8fb5}
+body[data-orb="active"]{--hud:#52e8d4}
+body[data-orb="listening"]{--hud:#8dffb8}
+body[data-orb="working"]{--hud:#ff8bd8}
+body[data-orb="speaking"]{--hud:#9fd8ff}
+.hud{position:relative;isolation:isolate;border:0!important;border-radius:0!important;background:transparent!important;box-shadow:none!important}
+.hud-frame{position:absolute;left:calc(var(--pad,14px) * -1);top:calc(var(--pad,14px) * -1);z-index:-1;pointer-events:none;color:var(--hud);transition:color .6s;line-height:0}
+.hud-frame svg{display:block;overflow:visible}
+#dashboard .console{gap:30px}
+@media (max-width:1100px){#dashboard .console{gap:28px}}
+@media (max-width:700px){#dashboard .console{gap:24px}}
