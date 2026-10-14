@@ -6,6 +6,7 @@ A Go program (standard library only) that provisions and supervises a local assi
 the repository root, one concern per file:
 
 - `main.go` — HTTP server, state, API handlers, gateway lifecycle
+- `supervisor.go` — the process manager: starts, health-checks, restarts and orders every service; its `Agent()` is the only source of truth for the assistant's state
 - `setup.go` — the first-run stage table (`setupStages`); the single source of truth for installer steps
 - `runtime.go` — private Node.js and OpenClaw installation
 - `llama.go` — GPU backend choice, llama.cpp download, chat/embedding model servers, OpenClaw registration

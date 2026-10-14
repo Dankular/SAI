@@ -81,10 +81,13 @@ func (a *app) diagnose() []diagCheck {
 		loaded := a.audioModelsLoaded()
 		add("Voice and turn models loaded", loaded[omniModelID] && loaded[turnModelID], fmt.Sprintf("omnivoice=%v smart-turn=%v", loaded[omniModelID], loaded[turnModelID]))
 	}
-	a.mu.Lock()
-	running := a.state.GatewayRunning
-	a.mu.Unlock()
-	add("OpenClaw Gateway", running && a.gatewayReady(), fmt.Sprintf("port %d, running=%v", gatewayPort, running))
+	agent := a.sup.Agent()
+	add("OpenClaw Gateway", agent.Awake && a.gatewayReady(), fmt.Sprintf("port %d, assistant %s", gatewayPort, agent.State))
+	for _, service := range a.sup.Status() {
+		if service.Wanted {
+			add("Process manager: "+service.Label, service.State == svcRunning, fmt.Sprintf("%s, %d restarts%s", service.State, service.Restarts, orDash2(service.Error)))
+		}
+	}
 	return checks
 }
 
@@ -129,4 +132,11 @@ func (a *app) handleDiagnose(w http.ResponseWriter, r *http.Request) {
 		ok = ok && c.OK
 	}
 	writeJSON(w, map[string]any{"ok": ok, "checks": checks})
+}
+
+func orDash2(s string) string {
+	if s == "" {
+		return ""
+	}
+	return ", " + s
 }

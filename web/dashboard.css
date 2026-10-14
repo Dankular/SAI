@@ -194,3 +194,36 @@ body.is-dashboard .topbar{flex:none;height:54px}
 .rail-bottom-text{flex:1 1 auto}
 @media (min-width:901px){.terminal-toggle{margin-left:15px}}
 @media (max-width:700px){.say-bar{gap:6px}.say-bar .button,.mic-button{padding:0 10px;font-size:12px}.rail-bottom{flex-wrap:nowrap}}
+
+/* ===== Glitching state label ("Ready", "Working", ...) ===== */
+.glitch{position:relative;display:inline-block;justify-self:center;animation:glitch var(--glitch-speed,3.2s) steps(1,end) infinite}
+.glitch::before,.glitch::after{content:attr(data-text);position:absolute;left:0;top:0;width:100%;pointer-events:none;opacity:.85}
+.glitch::before{color:#7ef0e0;clip-path:polygon(0 0,100% 0,100% 36%,0 36%);animation:glitch-top var(--glitch-speed,3.2s) steps(1,end) infinite}
+.glitch::after{color:#ff5fd2;clip-path:polygon(0 64%,100% 64%,100% 100%,0 100%);animation:glitch-bottom calc(var(--glitch-speed,3.2s) * 1.4) steps(1,end) infinite}
+.glitch.burst,.glitch.burst::before,.glitch.burst::after{animation-duration:.5s;animation-iteration-count:2}
+.orb-stage[data-state="idle"] .glitch{--glitch-speed:5s}
+.orb-stage[data-state="active"] .glitch{--glitch-speed:3.2s}
+.orb-stage[data-state="listening"] .glitch{--glitch-speed:2s}
+.orb-stage[data-state="speaking"] .glitch{--glitch-speed:1.6s}
+.orb-stage[data-state="working"] .glitch{--glitch-speed:.9s}
+@keyframes glitch{
+  0%,60%,100%{transform:none}
+  62%,64%{transform:translate(1.5px,0) skew(0deg)}
+  63%{transform:translate(-1.5px,0)}
+  66%{transform:translate(0,0) skew(5deg)}
+  68%{transform:none}
+}
+@keyframes glitch-top{
+  0%,60%,100%{transform:none}
+  62%,64%{transform:translate(2px,-1px)}
+  63%{transform:translate(-2px,1px)}
+  66%{transform:translate(9px,-1px) skew(-13deg)}
+  68%{transform:none}
+}
+@keyframes glitch-bottom{
+  0%,58%,100%{transform:none}
+  60%,64%{transform:translate(-2px,0)}
+  66%{transform:translate(-14px,3px) skew(21deg)}
+  68%{transform:none}
+}
+@media (prefers-reduced-motion:reduce){.glitch,.glitch::before,.glitch::after{animation:none}.glitch::before,.glitch::after{display:none}}

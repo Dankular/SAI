@@ -83,20 +83,24 @@ function render(snapshot) {
 
   reveal("dashboard");
   $("#welcome-name").textContent = snapshot.profile.userName || "there";
-  const gatewayReady = Boolean(snapshot.runtime && snapshot.runtime.gatewayReady);
+  // The process manager (snapshot.agent) is the only source of truth for what the assistant is
+  // doing; nothing in this page decides it, so every tab agrees.
+  const agent = snapshot.agent || { state: "asleep", label: "Assistant is asleep", awake: false, wanted: false };
+  ui.agent = agent;
   ui.warm = Boolean(snapshot.runtime && snapshot.runtime.gatewayWarm);
   ui.profile = snapshot.profile || {};
-  ui.waking = Boolean(snapshot.gatewayRunning) && !gatewayReady;
-  ui.awake = Boolean(snapshot.gatewayRunning) && gatewayReady;
+  ui.waking = agent.wanted && !agent.awake;
+  ui.awake = agent.awake;
   if (ui.awake && ui.wakeRequested) { ui.wakeRequested = false; greet(); }
   ui.inferenceBusy = Boolean(snapshot.runtime && snapshot.runtime.inferenceBusy);
   ensureOrb();
   applyOrb();
   updateSayBar();
-  $("#start-button").disabled = snapshot.gatewayRunning;
-  $("#stop-button").disabled = !snapshot.gatewayRunning;
+  $("#start-button").disabled = agent.wanted && agent.state !== "failed";
+  $("#stop-button").disabled = !agent.wanted;
   $("#overall-status").classList.toggle("online", ui.awake);
-  $("#overall-status b").textContent = ui.waking ? "Waking up…" : ui.awake ? "Assistant is awake" : "Assistant is asleep";
+  $("#overall-status").title = agent.detail || "";
+  $("#overall-status b").textContent = agent.state === "waking" ? "Waking up…" : agent.state === "recovering" ? "Recovering…" : agent.label;
   $("#step-title").textContent = snapshot.step || "Ready";
   $("#activity-state").textContent = snapshot.setupRunning || snapshot.memoryRunning ? "In progress" : snapshot.error ? "Needs attention" : "Updated";
   $("#activity-state").classList.toggle("attention", Boolean(snapshot.error));
@@ -217,7 +221,15 @@ function applyOrb() {
   if (stage) stage.dataset.state = state;
   let [title, hint] = ui.waking ? ["Waking up", "Getting everything ready, one moment"] : ORB_COPY[state];
   if (ui.awake && !ui.warm && state === "active") hint = "Ready. Your first reply may take a little longer";
-  $("#orb-state").textContent = title;
+  const stateLabel = $("#orb-state");
+  if (stateLabel.textContent !== title) {
+    // the glitch copies read their text from data-text; a changed word gets a short, harder burst
+    stateLabel.textContent = title;
+    stateLabel.dataset.text = title;
+    stateLabel.classList.remove("burst");
+    void stateLabel.offsetWidth;
+    stateLabel.classList.add("burst");
+  }
   $("#orb-hint").textContent = hint;
   orb?.setState(state);
 }

@@ -202,6 +202,7 @@ func (a *app) bootstrap() {
 	a.logLocked("Setup completed")
 	_ = a.persistLocked()
 	a.mu.Unlock()
+	a.wakeAssistant() // the process manager takes over everything the install started
 }
 
 // runSetupStage runs one stage, skipping a resumable one that already succeeded.

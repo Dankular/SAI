@@ -62,6 +62,20 @@ func (a *app) gatewayConfigSteps() ([][]string, error) {
 }
 
 // spokenHint is appended to a message when the reply will be spoken aloud.
+// timeHint tells the model the local time so greetings can fit the moment.
+func timeHint(now time.Time) string {
+	part := "night"
+	switch h := now.Hour(); {
+	case h >= 5 && h < 12:
+		part = "morning"
+	case h >= 12 && h < 17:
+		part = "afternoon"
+	case h >= 17 && h < 22:
+		part = "evening"
+	}
+	return "\n\n[Local time: " + now.Format("Monday 2 January, 15:04") + " (" + part + ").]"
+}
+
 const spokenHint = "\n\n[This will be spoken aloud. Answer in one to three short, natural sentences, the way you would say it. " +
 	"No lists, bullets, numbering, headings, bold or emoji. If there is a lot to say, give the main point and offer to say more.]"
 
@@ -92,10 +106,7 @@ func (a *app) handleVoiceChat(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "say something first", http.StatusBadRequest)
 		return
 	}
-	a.mu.Lock()
-	awake := a.state.GatewayRunning
-	a.mu.Unlock()
-	if !awake {
+	if !a.sup.Agent().Wanted {
 		http.Error(w, "your assistant is asleep; wake it up first", http.StatusConflict)
 		return
 	}
@@ -113,6 +124,7 @@ func (a *app) handleVoiceChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	content := text
+	content += timeHint(time.Now())
 	if in.Spoken {
 		// Small models follow what is nearest the end of the prompt, so the
 		// spoken-style instruction rides on each message instead of only
@@ -258,14 +270,19 @@ func (a *app) gatewayReady() bool {
 		if !a.llamaHealthy(llamaChatPort) {
 			return false
 		}
-		client := http.Client{Timeout: 1500 * time.Millisecond}
-		response, err := client.Get(fmt.Sprintf("http://127.0.0.1:%d/readyz", gatewayPort))
-		if err != nil {
-			return false
-		}
-		response.Body.Close()
-		return response.StatusCode == http.StatusOK
+		return a.gatewayAlive()
 	})
+}
+
+// gatewayAlive reports whether the OpenClaw Gateway itself answers its readiness probe.
+func (a *app) gatewayAlive() bool {
+	client := http.Client{Timeout: 1500 * time.Millisecond}
+	response, err := client.Get(fmt.Sprintf("http://127.0.0.1:%d/readyz", gatewayPort))
+	if err != nil {
+		return false
+	}
+	response.Body.Close()
+	return response.StatusCode == http.StatusOK
 }
 
 // gatewayErrorText turns an OpenAI-style error object into something a person can read.

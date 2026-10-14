@@ -74,6 +74,8 @@ type app struct {
 	inference        cachedBool
 	gwReady          cachedBool
 	gwWarm           atomic.Bool // first agent turn done; later turns are fast
+	sup              *supervisor
+	serviceError     bool // state.Error was set by the supervisor
 	ctx              context.Context
 	cancel           context.CancelFunc
 	resumeSetup      bool
@@ -105,6 +107,10 @@ func main() {
 		log.Fatal(err)
 	}
 	resumeSetup := a.resumeSetup
+	a.sup = a.newAppSupervisor()
+	// Anything still listening on our ports belongs to an earlier run that did not exit cleanly.
+	evictOrphans([]int{llamaChatPort, llamaEmbedPort, audioPort, gatewayPort}, a.recordCommandOutput)
+	go a.sup.Run()
 
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -161,21 +167,7 @@ func main() {
 			log.Printf("%s persona: %v", productName, err)
 		}
 		go a.syncChatContext()
-		go func() {
-			if err := a.startLlama(); err != nil {
-				log.Printf("%s model servers: %v", productName, err)
-			}
-		}()
-		go func() {
-			if err := a.ensureWhistle(); err != nil {
-				log.Printf("%s speech recognition model: %v", productName, err)
-			}
-		}()
-		go func() {
-			if err := a.startAudio(); err != nil {
-				log.Printf("%s voice: %v", productName, err)
-			}
-		}()
+		a.superviseInstalled()
 	}
 	select {
 	case <-signalCtx.Done():
@@ -188,9 +180,7 @@ func main() {
 	_ = server.Shutdown(shutdownCtx)
 	shutdownCancel()
 	a.cancel()
-	a.stopGateway()
-	a.stopLlama()
-	a.stopAudio()
+	a.sup.Shutdown()
 	if a.gatewayLog != nil {
 		_ = a.gatewayLog.Close()
 	}
@@ -292,8 +282,10 @@ func (a *app) handleState(w http.ResponseWriter, r *http.Request) {
 	_, entryErr := a.openclawEntry()
 	writeJSON(w, struct {
 		Snapshot
-		Runtime runtimeStatus `json:"runtime"`
-	}{a.state, runtimeStatus{
+		Agent    agentStatus     `json:"agent"`
+		Services []serviceStatus `json:"services"`
+		Runtime  runtimeStatus   `json:"runtime"`
+	}{a.authoritativeSnapshot(), a.sup.Agent(), a.sup.Status(), runtimeStatus{
 		PID:             os.Getpid(),
 		Executable:      executablePath(),
 		DataDir:         a.dataDir,
@@ -852,10 +844,7 @@ func (a *app) handleStart(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "finish local setup before starting the agent", http.StatusConflict)
 		return
 	}
-	if err := a.startGateway(); err != nil {
-		http.Error(w, err.Error(), http.StatusConflict)
-		return
-	}
+	a.wakeAssistant()
 	writeJSON(w, map[string]any{"ok": true})
 }
 
@@ -872,6 +861,39 @@ func (a *app) startGateway() error {
 			a.mu.Unlock()
 		}
 	}()
+	if err := a.spawnGateway(); err != nil {
+		return err
+	}
+	go a.warmGateway()
+	return nil
+}
+
+// startGatewayAndWait is the supervisor's start: begin the Gateway and return once it
+// answers, or say why it did not.
+func (a *app) startGatewayAndWait() error {
+	a.syncChatContext()
+	if err := a.spawnGateway(); err != nil {
+		return err
+	}
+	for deadline := time.Now().Add(4 * time.Minute); time.Now().Before(deadline); time.Sleep(500 * time.Millisecond) {
+		if a.ctx.Err() != nil {
+			return a.ctx.Err()
+		}
+		a.mu.Lock()
+		gone := a.gateway == nil
+		a.mu.Unlock()
+		if gone {
+			return fmt.Errorf("the gateway exited while starting: %s", tailFile(filepath.Join(a.dataDir, "gateway.log"), 500))
+		}
+		if a.gatewayAlive() {
+			return nil
+		}
+	}
+	return fmt.Errorf("the gateway did not become ready in time")
+}
+
+// spawnGateway launches the OpenClaw Gateway process if it is not already running.
+func (a *app) spawnGateway() error {
 	a.mu.Lock()
 	if a.gateway != nil && a.gateway.Process != nil {
 		a.state.GatewayRunning = true
@@ -898,7 +920,6 @@ func (a *app) startGateway() error {
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("start Gateway: %w", err)
 	}
-	go a.warmGateway()
 	a.mu.Lock()
 	a.gateway = cmd
 	a.state.GatewayRunning = true
@@ -947,7 +968,7 @@ func (a *app) handleStop(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	a.stopGateway()
+	a.sleepAssistant()
 	writeJSON(w, map[string]any{"ok": true})
 }
 
@@ -1015,7 +1036,7 @@ func (a *app) configureMemory(backend string) {
 	a.mu.Unlock()
 	if wasRunning {
 		a.setStep("Pausing the Gateway to update memory settings")
-		a.stopGateway()
+		a.sleepAssistant()
 		deadline := time.Now().Add(12 * time.Second)
 		for time.Now().Before(deadline) {
 			a.mu.Lock()
@@ -1083,9 +1104,7 @@ func (a *app) configureMemory(backend string) {
 	}
 	if wasRunning {
 		a.setStep("Restarting the OpenClaw Gateway")
-		if err := a.startGateway(); operationErr == nil && err != nil {
-			operationErr = err
-		}
+		a.wakeAssistant()
 	}
 	a.finishMemory(active, operationErr, wasRunning)
 }
@@ -1154,4 +1173,12 @@ func publicPath(p string) bool {
 		return true
 	}
 	return strings.HasPrefix(p, "/api/") || strings.HasPrefix(p, "/vendor/") || strings.HasPrefix(p, "/models/whistle/")
+}
+
+// authoritativeSnapshot is the saved state with the fields the process manager owns
+// overwritten by its live view, so a stale saved flag can never contradict it.
+func (a *app) authoritativeSnapshot() Snapshot {
+	snapshot := a.state
+	snapshot.GatewayRunning = a.sup.Agent().Wanted
+	return snapshot
 }
