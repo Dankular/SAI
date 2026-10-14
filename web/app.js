@@ -229,6 +229,9 @@ function applyOrb() {
     stateLabel.classList.remove("burst");
     void stateLabel.offsetWidth;
     stateLabel.classList.add("burst");
+    // the burst is three quick jolts; afterwards the state's own rhythm resumes
+    clearTimeout(stateLabel.burstTimer);
+    stateLabel.burstTimer = setTimeout(() => stateLabel.classList.remove("burst"), 1400);
   }
   $("#orb-hint").textContent = hint;
   orb?.setState(state);
