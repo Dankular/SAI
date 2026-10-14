@@ -34,13 +34,72 @@ the servers, and serves the dashboard on a random loopback port.
 
 Nothing is installed system-wide. Everything lives in `%LOCALAPPDATA%\SovereignAI`.
 
-## Run
+## Install
+
+1. Download `SovereignAI.exe` from the [latest release](https://github.com/Dankular/SAI/releases/latest).
+   It is a single file with the dashboard and reference voice built in. There is no installer.
+2. Put it anywhere (for example `C:\Tools\SovereignAI\`) and double-click it. Windows SmartScreen may
+   warn about an unsigned app: choose **More info**, then **Run anyway**.
+3. Your browser opens the dashboard. Enter your name, a name for the assistant, what you want to use it
+   for, and a reply style, then press **Begin setup**.
+4. Wait for the stages to finish (about 7 GB of downloads; 10-30 minutes depending on your connection).
+   If one fails, press retry. It resumes from the first unfinished stage.
+5. When setup completes the assistant wakes up and greets you. Next time, run the exe again and press
+   **Wake up**.
+
+To uninstall, close the app and delete `%LOCALAPPDATA%\SovereignAI` and the exe.
+
+### Installing from a script or an agent
+
+The same steps work without a browser. The app is driven by a local HTTP API:
+
+```powershell
+$env:SOVEREIGNAI_NO_BROWSER = "1"
+Start-Process .\SovereignAI.exe
+Start-Sleep 5
+$base = (Get-Content "$env:LOCALAPPDATA\SovereignAI\server.url").Trim()   # e.g. http://127.0.0.1:61159
+
+# 1. start setup (replyStyle: concise | balanced | detailed)
+$profile = @{ userName = "Alex"; agentName = "Sovereign"; purpose = "Daily planning and research"; replyStyle = "balanced" } | ConvertTo-Json
+Invoke-RestMethod "$base/api/setup" -Method Post -Body $profile -ContentType "application/json" -Headers @{ Origin = $base }
+
+# 2. poll until setupComplete is true (setupRunning false and a non-empty error means it failed)
+do { Start-Sleep 15; $s = Invoke-RestMethod "$base/api/state" } until ($s.setupComplete -or (-not $s.setupRunning -and $s.error))
+
+# 3. verify: every check should pass
+(Invoke-RestMethod "$base/api/diagnose") | ConvertTo-Json -Depth 5
+```
+
+To retry after a failure, `POST $base/api/install` (add `?from=N` to restart from stage N). Requests must
+come from loopback; POSTs need an `Origin` header matching the server address, as above. The app must stay
+running for the assistant to stay awake. The exe can be launched at logon with a Startup-folder shortcut.
+
+### Intel GPUs (Arc and integrated)
+
+Setup is identical: download, run, fill in the profile. The app detects Intel graphics from the driver
+files in `System32` (`ze_intel_gpu64.dll`, `igc64.dll`) and picks the backends itself:
+
+| Part | Backend used | Download |
+|---|---|---|
+| Chat and memory models | llama.cpp **SYCL** (Intel XPU, via Level Zero) | about 140 MB; bundles the oneAPI runtime, so no oneAPI install is needed |
+| Voice and Smart Turn | audio.cpp **Vulkan** (audio.cpp has no SYCL build) | about 60 MB |
+
+Before you start: install the current Intel graphics driver, since SYCL needs its Level Zero component. If
+the machine also has an NVIDIA GPU, NVIDIA (CUDA) is chosen instead. If a backend fails to start, the app
+falls back to the CPU automatically and says so in the activity log (**View terminal**). To force a choice:
+`SOVEREIGNAI_LLAMA_BACKEND=sycl` (or `vulkan`, `cpu`) and `SOVEREIGNAI_AUDIO_BACKEND=vulkan`.
+
+After setup, `GET /api/state` shows which backends were chosen, and `GET /api/diagnose` confirms the servers
+are running. **Status: the download and backend selection are checked against the published llama.cpp and
+audio.cpp releases, but the Intel path has not been run on real Intel hardware.** Reports are welcome.
+
+## Run from source
 
 ```powershell
 go run -buildvcs=false .
 ```
 
-or build once and double-click:
+or build once and double-click (Go 1.25+ required):
 
 ```powershell
 go build -buildvcs=false -o dist\SovereignAI.exe .
