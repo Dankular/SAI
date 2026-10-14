@@ -2,4 +2,3 @@ dist/
 *.exe
 .env
 assets/voices/*.mp3
-assets/voices/*.wav

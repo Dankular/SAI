@@ -9,8 +9,8 @@ Put two files here **before building** and they are embedded in the program:
 
 Convert other formats first, e.g. `ffmpeg -i clip.mp3 -ac 1 -ar 24000 -c:a pcm_s16le default.wav`.
 
-The audio files are listed in `.gitignore` because a recording of a real person's voice should not be
-committed to a public repository by accident. Without them the assistant uses a described voice
+`jarvis.wav` is committed so every build carries the same voice. Only commit recordings you have the right to
+share; the `.mp3` source is gitignored. Without a clip the assistant uses a described voice
 (`male, middle-aged, british accent, moderate pitch`).
 
 To override the voice on an installed copy, place `default.wav` and `default.txt` in
