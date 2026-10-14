@@ -95,6 +95,7 @@ function render(snapshot) {
   ui.inferenceBusy = Boolean(snapshot.runtime && snapshot.runtime.inferenceBusy);
   ensureOrb();
   applyOrb();
+  orb?.setWaking(ui.waking);
   updateSayBar();
   $("#start-button").disabled = agent.wanted && agent.state !== "failed";
   $("#stop-button").disabled = !agent.wanted;
@@ -393,6 +394,7 @@ function interruptAgent() {
 }
 
 async function sendToAgent(text) {
+  orb?.stimulus(); // the user's input reaches the neuron
   ui.chatBusy = true;
   ui.turnSpeaking = false;
   speech?.stop();

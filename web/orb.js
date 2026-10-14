@@ -460,8 +460,10 @@ export function createOrb(container) {
     },
     /** the reply has begun: a pink flash through the neuron and the sphere */
     flash() { neuron.flash(); },
-    /** fire one pulse through the neuron */
-    pulse() { neuron.pulse(); },
+    /** the user's input arrived: one incoming-stimulus pulse through the neuron */
+    stimulus() { neuron.stimulus(); },
+    /** the assistant is waking up: the neuron breathes its refractory afterglow */
+    setWaking(on) { neuron.setWaking(on); },
     dispose() {
       neuron.dispose();
       cancelAnimationFrame(raf);
@@ -486,7 +488,7 @@ function fallbackOrb(container) {
   return {
     setLevel(value) { level = Math.max(0, Math.min(1, Number(value) || 0)); el.style.setProperty("--level", level.toFixed(3)); },
     setState(name) { el.dataset.state = name; },
-    flash() {}, pulse() {},
+    flash() {}, stimulus() {}, setWaking() {},
     dispose() { el.remove(); },
   };
 }

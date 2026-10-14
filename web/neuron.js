@@ -3,22 +3,26 @@
 // Adapted from "Bioelectric consciousness engine" by Techartist (MIT, see
 // vendor/BIOELECTRIC_LICENSE.txt): a soma with dendrite trees that collect a signal and
 // axons that carry it away. The original runs one hand-triggered firing sequence; here the
-// sequence is fired by the assistant's state:
+// sequence is mapped onto the conversation, one phase per thing that is happening:
 //
-//   thinking   the model is running: repeated pulses sweep in along the dendrites
-//   speaking   its voice is playing: pulses fire in step with the loud parts of the speech
-//   responding a hot pink flash through the whole neuron the moment the reply begins
+//   incoming stimulus   (phase 1) the user's input: pulses sweep in along the dendrites
+//                       while they speak, and once when a typed or spoken message is sent
+//   soma merge          (phase 2) the model is thinking: the signals converge and burn at the core
+//   axon outflow        (phase 3) the assistant is speaking: pulses fire out along the axons,
+//                       in step with the loud parts of its voice
+//   refractory period   (phase 4) the violet afterglow: used while it wakes up, and as the neuron
+//                       settles after a reply
+//   responding          a hot pink flash through the whole neuron when the reply begins
 //
 // Pink is reserved for that flash, so it always reads as "it just answered".
 import * as THREE from "/vendor/three.module.min.js";
 
 const SOMA = 4.0;
-const MAX_DENDRITE = 35.0;
-const MAX_AXON = 50.0;
-const FIT = 2.05; // the whole neuron is scaled to reach this far inside a sphere of radius 2
+const FIT = 1.78; // the neuron fills the sphere out to here (the sphere's radius is 2)
+const R0 = 50;    // the neuron's own units after fitting; the group is scaled by FIT / R0
 
-// phases: 0 rest, 1 signal arrives along the dendrites, 2 soma merge, 3 axon outflow, 4 refractory
-const PHASE_SPEED = [0, 0.8, 2.5, 0.95, 0.5];
+// phases: 0 rest, 1 incoming stimulus, 2 soma merge, 3 axon outflow, 4 refractory period
+const PHASE_SPEED = [0, 0.8, 1.6, 0.95, 0.5];
 
 const f = (n) => n.toFixed(1);
 
@@ -44,6 +48,9 @@ uniform float uProgress;
 uniform float uFlash;
 uniform float uVisible;
 uniform int uIsAxon;
+uniform float uSoma;
+uniform float uReachD;
+uniform float uReachA;
 uniform vec3 uCyan;
 uniform vec3 uBlue;
 uniform vec3 uGold;
@@ -66,19 +73,24 @@ void main(){
   float flow=vnoise(vec2(vUv.x*20.0-uTime*2.0,vUv.y*10.0+uTime))*0.5+0.5;
   float axial=0.65+0.35*sin(vUv.x*34.0-uTime*8.0);
   vec3 pulse=vec3(0.0);
+  if(uPhase==2){
+    // soma merge: the signals converge and burn where the fibres meet the core
+    float burn=sin(uProgress*3.14159)*(1.0-smoothstep(uSoma,(uSoma*5.0),vDist));
+    pulse+=uGold*burn*(0.9+0.6*flow)*2.6;
+  }
   if(uIsAxon==0){
     if(uPhase==1){
-      float wave=mix(${f(MAX_DENDRITE)},${f(SOMA)},uProgress);
-      float head=1.0-smoothstep(0.0,2.6,abs(vDist-wave));
-      float trail=step(wave,vDist)*exp(-(vDist-wave)*0.16);
-      float merge=(1.0-smoothstep(${f(SOMA)},${f(SOMA + 8)},vDist))*smoothstep(0.65,1.0,uProgress);
+      float wave=mix(uReachD,uSoma,uProgress);
+      float head=1.0-smoothstep(0.0,7.0,abs(vDist-wave));
+      float trail=step(wave,vDist)*exp(-(vDist-wave)*0.06);
+      float merge=(1.0-smoothstep(uSoma,(uSoma*3.0),vDist))*smoothstep(0.65,1.0,uProgress);
       pulse=uGold*(max(head*1.6,trail*0.65)+merge*0.8)*flow*axial*3.4;
     }
   }else if(uPhase==3){
-    float wave=mix(${f(SOMA)},${f(MAX_AXON + 18)},uProgress);
-    float head=1.0-smoothstep(0.0,3.6,abs(vDist-wave));
-    float trail=step(vDist,wave)*exp(-(wave-vDist)*0.1);
-    float launch=(1.0-smoothstep(${f(SOMA)},${f(SOMA + 7)},vDist))*(1.0-smoothstep(0.0,0.28,uProgress));
+    float wave=mix(uSoma,uReachA*1.12,uProgress);
+    float head=1.0-smoothstep(0.0,9.0,abs(vDist-wave));
+    float trail=step(vDist,wave)*exp(-(wave-vDist)*0.04);
+    float launch=(1.0-smoothstep(uSoma,(uSoma*2.75),vDist))*(1.0-smoothstep(0.0,0.28,uProgress));
     pulse=(uOrange+uGold*0.45)*(max(head*2.0,trail*0.9)+launch*1.2)*flow*axial*4.4;
   }
   if(uPhase==4) pulse+=uViolet*(1.0-uProgress)*edge*1.2;
@@ -202,8 +214,33 @@ export function createNeuron({ pixelRatio = 1 } = {}) {
   }
 
   const group = new THREE.Group();
-  const dendriteMesh = new THREE.Mesh(merge(dendrites), material(0));
-  const axonMesh = new THREE.Mesh(merge(axons), material(1));
+  const dendriteGeometry = merge(dendrites);
+  const axonGeometry = merge(axons);
+  // farthest point of each kind of fibre, so the whole neuron can be fitted to the sphere exactly
+  const reach = (g) => { let r = 0; const p = g.getAttribute("position").array; for (let i = 0; i < p.length; i += 3) r = Math.max(r, Math.hypot(p[i], p[i + 1], p[i + 2])); return r; };
+  const reachAll = Math.max(reach(dendriteGeometry), reach(axonGeometry), SOMA);
+  // Squash the tree radially so it fills the sphere instead of poking out: near the core the
+  // fibres keep their spacing, and the longest ones ease in towards the edge rather than being cut.
+  const k = reachAll * 0.42;
+  const squash = (r) => R0 * Math.tanh(r / k) / Math.tanh(reachAll / k);
+  for (const g of [dendriteGeometry, axonGeometry]) {
+    const p = g.getAttribute("position");
+    for (let i = 0; i < p.count; i++) {
+      const x = p.getX(i), y = p.getY(i), z = p.getZ(i);
+      const r = Math.hypot(x, y, z) || 1;
+      const s = squash(r) / r;
+      p.setXYZ(i, x * s, y * s, z * s);
+    }
+    p.needsUpdate = true;
+  }
+  const reachD = reach(dendriteGeometry);
+  const reachA = reach(axonGeometry);
+  const somaR = squash(SOMA);
+  uniforms.uSoma = { value: somaR };
+  uniforms.uReachD = { value: reachD };
+  uniforms.uReachA = { value: reachA };
+  const dendriteMesh = new THREE.Mesh(dendriteGeometry, material(0));
+  const axonMesh = new THREE.Mesh(axonGeometry, material(1));
 
   const synGeometry = new THREE.BufferGeometry();
   synGeometry.setAttribute("position", new THREE.Float32BufferAttribute(tips, 3));
@@ -216,56 +253,74 @@ export function createNeuron({ pixelRatio = 1 } = {}) {
 
   // the soma: a soft glowing core where the signals meet
   const soma = new THREE.Mesh(
-    new THREE.IcosahedronGeometry(SOMA * 0.62, 3),
+    new THREE.IcosahedronGeometry(somaR * 0.62, 3),
     new THREE.MeshBasicMaterial({ color: 0x00e5ff, transparent: true, opacity: 0.18, blending: THREE.AdditiveBlending, wireframe: true, depthWrite: false, depthTest: false }),
   );
   const somaGlow = new THREE.Mesh(
-    new THREE.SphereGeometry(SOMA * 0.5, 24, 24),
+    new THREE.SphereGeometry(somaR * 0.5, 24, 24),
     new THREE.MeshBasicMaterial({ color: 0xffc24a, transparent: true, opacity: 0, blending: THREE.AdditiveBlending, depthWrite: false, depthTest: false }),
   );
   const parts = [dendriteMesh, axonMesh, synapses, soma, somaGlow];
   for (const part of parts) { part.renderOrder = 3; group.add(part); } // after the shell: the neuron glows through it
-  group.scale.setScalar(FIT / MAX_AXON);
+  group.scale.setScalar(FIT / R0);
 
   // ---- behaviour ----
+  // Each phase is driven by what the assistant is doing, not chained one after another:
+  // loopPhase repeats while a state lasts, and one-shot phases (a stimulus, an afterglow) queue up.
   let phase = 0;
   let progress = 0;
   let cooldown = 0;
   let flash = 0;
-  let mode = "idle"; // idle | thinking | speaking
-  let visibleTarget = 0.6;
-  let rate = 2.0;
+  let loopPhase = 0;
+  let rate = 1.8;
+  let waking = false;
+  let lastMode = "idle";
+  const queue = [];
 
-  const fire = () => { if (phase === 0) { phase = 1; progress = 0; } };
+  const LOOPS = { listening: [1, 1.5], working: [2, 1.3], speaking: [3, 2.4] };
+  const VISIBLE = { idle: 0.3, active: 0.7, listening: 0.85, working: 1.3, speaking: 1.3 };
+  let visibleTarget = 0.6;
+
+  function applyMode() {
+    const mode = waking ? "waking" : lastMode;
+    if (waking) { loopPhase = 4; rate = 0.9; }
+    else if (LOOPS[mode]) [loopPhase, rate] = LOOPS[mode];
+    else { loopPhase = 0; rate = 1.8; }
+    visibleTarget = waking ? 0.9 : VISIBLE[lastMode] ?? 0.6;
+  }
 
   return {
     group,
     /** the orb's state: idle | active | listening | working | speaking */
     setMode(name) {
-      mode = name === "working" ? "thinking" : name === "speaking" ? "speaking" : "idle";
-      visibleTarget = { idle: 0.3, active: 0.7, listening: 0.85, working: 1.3, speaking: 1.3 }[name] ?? 0.3;
-      rate = mode === "speaking" ? 2.7 : 1.9;
+      const was = lastMode;
+      lastMode = name;
+      // after thinking or speaking the neuron settles through its refractory period
+      if ((was === "working" || was === "speaking") && name !== "working" && name !== "speaking" && !waking) queue.push(4);
+      applyMode();
     },
-    /** one pulse along the whole neuron */
-    pulse: fire,
+    /** the assistant is waking up: the refractory afterglow breathes until it is ready */
+    setWaking(on) {
+      if (on === waking) return;
+      waking = on;
+      applyMode();
+    },
+    /** the user's input arrived (a typed or spoken message was sent): one incoming-stimulus pulse */
+    stimulus() { queue.push(1); },
     /** the hot pink flash: the reply has begun */
     flash() { flash = 1; },
     update(dt, time, level) {
       uniforms.uTime.value = time;
       uniforms.uVisible.value += (visibleTarget - uniforms.uVisible.value) * Math.min(1, 3 * dt);
       cooldown = Math.max(0, cooldown - dt);
-      // thinking: a fresh pulse as soon as the last one has cleared; speaking: pulse on loud syllables
       if (phase === 0 && cooldown === 0) {
-        if (mode === "thinking") fire();
-        else if (mode === "speaking" && level > 0.28) fire();
+        if (queue.length) { phase = queue.shift(); progress = 0; }
+        else if (loopPhase === 3 && level > 0.28) { phase = 3; progress = 0; } // outflow follows the loud syllables
+        else if (loopPhase && loopPhase !== 3) { phase = loopPhase; progress = 0; }
       }
       if (phase > 0) {
         progress += dt * PHASE_SPEED[phase] * rate;
-        if (progress >= 1) {
-          progress = 0;
-          phase += 1;
-          if (phase > 4) { phase = 0; cooldown = mode === "thinking" ? 0.12 : 0.05; }
-        }
+        if (progress >= 1) { cooldown = phase === 4 ? 0.2 : 0.06; progress = 0; phase = 0; }
       }
       flash = Math.max(0, flash - dt * 1.15);
       uniforms.uPhase.value = phase;
@@ -273,7 +328,7 @@ export function createNeuron({ pixelRatio = 1 } = {}) {
       uniforms.uFlash.value = flash * flash * (3 - 2 * flash);
       const merging = phase === 2 ? Math.sin(progress * Math.PI) : 0;
       somaGlow.material.opacity = Math.min(0.9, merging * 0.7 + (phase === 3 ? 0.25 * (1 - progress) : 0) + flash * 0.8);
-      somaGlow.material.color.set(flash > 0.05 ? 0xff2fb9 : 0xffc24a);
+      somaGlow.material.color.set(flash > 0.05 ? 0xff2fb9 : phase === 4 ? 0x7a5cff : 0xffc24a);
       soma.material.opacity = 0.14 + uniforms.uVisible.value * 0.12 + flash * 0.4;
       soma.material.color.set(flash > 0.05 ? 0xff5fd2 : 0x00e5ff);
       group.rotation.y += dt * 0.08;
