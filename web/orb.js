@@ -8,6 +8,7 @@
 // noise scaled by the audio level, a fresnel-lit shell, and an additive halo.
 // The simplex noise is Ian McEwan / Ashima Arts' public implementation (MIT).
 import * as THREE from "/vendor/three.module.min.js";
+import { createNeuron } from "/neuron.js";
 
 const NOISE = /* glsl */ `
 vec3 mod289(vec3 x){return x-floor(x*(1.0/289.0))*289.0;}
@@ -102,6 +103,7 @@ uniform vec3 uColorB;
 uniform vec3 uColorC;
 uniform float uLevel;
 uniform float uGlow;
+uniform float uFlash;
 varying vec3 vNormal;
 varying vec3 vView;
 varying float vDisp;
@@ -111,6 +113,7 @@ ${GRADIENT}
 void main(){
   float fres=pow(1.0-max(dot(normalize(vNormal),normalize(vView)),0.0),1.7);
   vec3 col=stateGradient(vHeight,vWarp+vDisp*1.4,uLevel,uColorA,uColorC,uColorB);
+  col=mix(col,vec3(1.0,0.18,0.72),uFlash*0.75);
   col=mix(col,uColorA*1.3,fres*0.45);
   float a=(0.16+fres*0.7)*uGlow*(0.75+uLevel*0.9);
   gl_FragColor=vec4(col*(0.65+uLevel*1.1),clamp(a,0.0,1.0));
@@ -123,6 +126,7 @@ uniform vec3 uColorB;
 uniform vec3 uColorC;
 uniform float uLevel;
 uniform float uGlow;
+uniform float uFlash;
 varying vec3 vNormal;
 varying vec3 vView;
 varying float vDisp;
@@ -133,6 +137,7 @@ void main(){
   float facing=max(dot(normalize(vNormal),normalize(vView)),0.0);
   float fres=pow(1.0-facing,2.2);
   vec3 col=stateGradient(vHeight,vWarp*1.3+vDisp*1.8,uLevel,uColorA,uColorC,uColorB);
+  col=mix(col,vec3(1.0,0.18,0.72),uFlash*0.55);
   float light=0.55+0.45*facing;
   float heart=pow(facing,2.2);
   col+=mix(uColorC,uColorA,0.5)*heart*0.55;
@@ -156,13 +161,14 @@ const HALO_FRAG = /* glsl */ `
 uniform vec3 uColorA;
 uniform float uLevel;
 uniform float uGlow;
+uniform float uFlash;
 varying vec3 vNormal;
 varying vec3 vView;
 void main(){
   float facing=abs(dot(normalize(vNormal),normalize(vView)));
   float fres=pow(1.0-facing,3.4);
-  float a=fres*(0.3+uLevel*1.5)*uGlow;
-  gl_FragColor=vec4(uColorA*(1.0+uLevel),clamp(a,0.0,1.0));
+  float a=fres*(0.3+uLevel*1.5+uFlash*1.8)*uGlow;
+  gl_FragColor=vec4(mix(uColorA*(1.0+uLevel),vec3(1.0,0.2,0.75),uFlash),clamp(a,0.0,1.0));
 }`;
 
 
@@ -293,6 +299,7 @@ export function createOrb(container) {
     uCalm: { value: 0.4 },
     uSpeed: { value: 1.0 },
     uGlow: { value: 0.85 },
+    uFlash: { value: 0 },
     uColorA: { value: new THREE.Color(STATES.idle.a) },
     uColorB: { value: new THREE.Color(STATES.idle.b) },
     uColorC: { value: new THREE.Color(STATES.idle.c) },
@@ -306,6 +313,10 @@ export function createOrb(container) {
     }),
   );
   group.add(surface);
+
+  // The neuron inside the sphere; it fires with the assistant's work and flashes pink on a reply.
+  const neuron = createNeuron({ pixelRatio: Math.min(window.devicePixelRatio || 1, 2) });
+  group.add(neuron.group);
 
   const mesh = new THREE.Mesh(
     new THREE.IcosahedronGeometry(2, 9),
@@ -418,6 +429,9 @@ export function createOrb(container) {
     spin += (target.spin - spin) * k;
     pulse += (target.pulse - pulse) * k;
 
+    neuron.update(dt, uniforms.uTime.value, level);
+    uniforms.uFlash.value = neuron.flashAmount();
+
     group.rotation.y += dt * spin;
     group.rotation.x = Math.sin(uniforms.uTime.value * 0.21) * 0.12;
     const scale = 1 + uniforms.uLevel.value * 0.07 + pulse * Math.sin(uniforms.uTime.value * 2.2);
@@ -439,11 +453,17 @@ export function createOrb(container) {
     },
     setState(name) {
       target = STATES[name] || STATES.idle;
+      neuron.setMode(name);
       targetA.set(target.a);
       targetB.set(target.b);
       targetC.set(target.c);
     },
+    /** the reply has begun: a pink flash through the neuron and the sphere */
+    flash() { neuron.flash(); },
+    /** fire one pulse through the neuron */
+    pulse() { neuron.pulse(); },
     dispose() {
+      neuron.dispose();
       cancelAnimationFrame(raf);
       observer.disconnect();
       document.removeEventListener("visibilitychange", onVisibility);
@@ -466,6 +486,7 @@ function fallbackOrb(container) {
   return {
     setLevel(value) { level = Math.max(0, Math.min(1, Number(value) || 0)); el.style.setProperty("--level", level.toFixed(3)); },
     setState(name) { el.dataset.state = name; },
+    flash() {}, pulse() {},
     dispose() { el.remove(); },
   };
 }

@@ -434,6 +434,7 @@ async function sendToAgent(text) {
       const event = JSON.parse(line);
       if (event.error) throw new Error(event.error);
       if (!event.delta) return;
+      if (!rawReply) orb?.flash(); // the reply has begun: pink flash through the neuron
       rawReply += event.delta;
       bubble.innerHTML = renderMarkdown(rawReply);
       $("#convo").scrollTop = $("#convo").scrollHeight;
