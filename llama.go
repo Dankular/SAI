@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"regexp"
 	"runtime"
@@ -36,7 +37,7 @@ const (
 	chatFile       = "Agents-A1-4B-Q4_K_M.gguf"
 	embedRepo      = "ggml-org/embeddinggemma-2-GGUF"
 	embedFile      = "embeddinggemma-2-Q8_0.gguf"
-	chatContext    = 16384
+	chatContext    = 32768 // OpenClaw's own prompt is ~11k tokens; leave room for history
 )
 
 type llamaState struct {
@@ -79,20 +80,27 @@ func (a *app) setLlamaBackend(name string) {
 
 // --- GPU detection and backend ladder ---------------------------------------
 
-var cudaVersionRE = regexp.MustCompile(`CUDA Version:\s*(\d+)\.(\d+)`)
+var cudaVersionRE = regexp.MustCompile(`CUDA (?:UMD )?Version:\s*(\d+)\.(\d+)`)
 
 // detectGPU reports which GPU vendors are present and the highest CUDA version
 // the NVIDIA driver supports (0.0 if unknown).
 func detectGPU() (nvidia, intel bool, cudaMajor, cudaMinor int) {
-	out, err := exec.Command("reg.exe", "query", `HKLM\SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11cd-bfc1-08002be10318}`, "/s", "/v", "DriverDesc").Output()
-	if err == nil {
-		text := strings.ToLower(string(out))
-		nvidia = strings.Contains(text, "nvidia")
-		intel = strings.Contains(text, "intel(r) arc") || strings.Contains(text, "intel(r) iris") || strings.Contains(text, "intel(r) uhd") || strings.Contains(text, "intel(r) graphics")
+	system32 := filepath.Join(envValue(os.Environ(), "SystemRoot"), "System32")
+	has := func(names ...string) bool {
+		for _, name := range names {
+			if isFile(filepath.Join(system32, name)) {
+				return true
+			}
+		}
+		return false
 	}
+	// Driver files are a more reliable signal than WMI or the registry, and
+	// need no extra tools. A wrong guess is harmless: the backend ladder in
+	// startLlama falls through to the next backend if one does not start.
+	nvidia = has("nvcuda.dll", "nvidia-smi.exe")
+	intel = has("ze_intel_gpu64.dll", "igc64.dll", "igdumdim64.dll", "igd10iumd64.dll")
 	if nvidia {
-		smi := filepath.Join(envValue(os.Environ(), "SystemRoot"), "System32", "nvidia-smi.exe")
-		if out, err := exec.Command(smi).Output(); err == nil {
+		if out, err := exec.Command(filepath.Join(system32, "nvidia-smi.exe")).Output(); err == nil {
 			if m := cudaVersionRE.FindStringSubmatch(string(out)); m != nil {
 				cudaMajor, _ = strconv.Atoi(m[1])
 				cudaMinor, _ = strconv.Atoi(m[2])
@@ -108,21 +116,26 @@ func (a *app) backendCandidates() []string {
 	if forced := strings.ToLower(os.Getenv("SOVEREIGNAI_LLAMA_BACKEND")); forced != "" {
 		return []string{forced}
 	}
+	// NVIDIA -> CUDA and Intel -> SYCL (XPU), each falling back to CPU only.
+	// Vulkan is used solely for GPUs that are neither (e.g. AMD).
 	var ladder []string
 	if runtime.GOARCH == "arm64" {
 		ladder = []string{"vulkan", "cpu"}
 	} else {
 		nvidia, intel, major, minor := detectGPU()
-		if nvidia && (major > 12 || major == 12 && minor >= 4) {
+		if nvidia && (major == 0 || major > 12 || major == 12 && minor >= 4) {
 			ladder = append(ladder, "cuda")
 		}
 		if intel {
 			ladder = append(ladder, "sycl")
 		}
-		ladder = append(ladder, "vulkan", "cpu")
+		if len(ladder) == 0 && !nvidia {
+			ladder = append(ladder, "vulkan")
+		}
+		ladder = append(ladder, "cpu")
 	}
 	if saved, err := os.ReadFile(filepath.Join(a.llamaRoot(), "backend.txt")); err == nil {
-		if name := strings.TrimSpace(string(saved)); name != "" {
+		if name := strings.TrimSpace(string(saved)); name != "" && contains(ladder, name) {
 			reordered := []string{name}
 			for _, b := range ladder {
 				if b != name {
@@ -229,6 +242,9 @@ func (a *app) ensureBackend(backend string) (string, error) {
 		return "", err
 	}
 	_, _, driverMajor, driverMinor := detectGPU()
+	if driverMajor == 0 {
+		driverMajor, driverMinor = 12, 4 // version unreadable: assume the oldest published CUDA build
+	}
 	cudaMajor, cudaMinor := 0, 0
 	if backend == "cuda" {
 		if cudaMajor, cudaMinor = cudaBuildVersion(release, driverMajor, driverMinor); cudaMajor == 0 {
@@ -333,7 +349,12 @@ func extractZipAll(archive, dest string) error {
 // ensureModel downloads one GGUF from Hugging Face and verifies it against the
 // repository's published SHA-256.
 func (a *app) ensureModel(repo, file, dest string) error {
-	response, err := a.httpGet("https://huggingface.co/api/models/" + repo + "/tree/main")
+	dir := path.Dir(file)
+	treeURL := "https://huggingface.co/api/models/" + repo + "/tree/main"
+	if dir != "." {
+		treeURL += "/" + dir
+	}
+	response, err := a.httpGet(treeURL)
 	if err != nil {
 		return fmt.Errorf("look up %s: %w", repo, err)
 	}
@@ -434,7 +455,9 @@ func (a *app) startLlama() error {
 		}
 		if err == nil {
 			a.setLlamaBackend(backend)
-			_ = os.WriteFile(filepath.Join(a.llamaRoot(), "backend.txt"), []byte(backend+"\n"), 0600)
+			if os.Getenv("SOVEREIGNAI_LLAMA_BACKEND") == "" {
+				_ = os.WriteFile(filepath.Join(a.llamaRoot(), "backend.txt"), []byte(backend+"\n"), 0600)
+			}
 			a.recordCommandOutput("Local model servers are running on the " + backend + " backend")
 			return nil
 		}
@@ -463,7 +486,9 @@ func (a *app) launchLlama(backend, dir string) error {
 		model string
 		args  []string
 	}{
-		{"chat", llamaChatPort, a.chatModel(), []string{"--alias", chatModelID, "-c", strconv.Itoa(chatContext), "--jinja"}},
+		// One slot: OpenClaw prompts are ~11k tokens, so parallel slots sharing the window would overflow it
+		// whenever two requests overlap. 8-bit KV cache keeps the larger window within the same VRAM.
+		{"chat", llamaChatPort, a.chatModel(), []string{"--alias", chatModelID, "-c", strconv.Itoa(chatContext), "--jinja", "-np", "1", "-fa", "on", "--cache-type-k", "q8_0", "--cache-type-v", "q8_0"}},
 		{"embeddings", llamaEmbedPort, a.embedModel(), []string{"--alias", embedModelID, "--embeddings", "-c", "2048", "-b", "2048", "-ub", "2048"}},
 	}
 	for _, server := range servers {
@@ -534,14 +559,9 @@ func (a *app) stopLlamaLocked() {
 // llama.cpp provider's existing-server path, memory embeddings through the
 // OpenAI-compatible remote embedding settings.
 func (a *app) registerLocalModels() error {
-	chatURL := fmt.Sprintf("http://127.0.0.1:%d/v1", llamaChatPort)
 	embedURL := fmt.Sprintf("http://127.0.0.1:%d/v1", llamaEmbedPort)
-	// `onboard --non-interactive` is avoided: on Windows it fails removing its own
-	// temporary SQLite file (EBUSY) before applying anything. Declaring the
-	// provider directly is equivalent for an external OpenAI-compatible server.
-	chatProvider := fmt.Sprintf(`{"baseUrl":%q,"apiKey":"llama-cpp-local","api":"openai-completions","models":[{"id":%q,"name":"Agents-A1 4B Q4_K_M","reasoning":false,"input":["text"],"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0},"contextWindow":%d,"maxTokens":4096,"compat":{"supportsTools":true}}]}`, chatURL, chatModelID, chatContext)
 	steps := [][]string{
-		{"config", "set", "models.providers.llama-cpp", chatProvider, "--strict-json"},
+		{"config", "set", "models.providers.llama-cpp", chatProviderJSON(), "--strict-json"},
 		{"config", "set", "gateway.mode", "local"},
 		{"models", "set", "llama-cpp/" + chatModelID},
 		{"config", "set", "memory.search.provider", "openai"},
@@ -550,10 +570,97 @@ func (a *app) registerLocalModels() error {
 		{"config", "set", "memory.search.model", embedModelID},
 		{"config", "set", "memory.search.fallback", "none"},
 	}
+	gateway, err := a.gatewayConfigSteps()
+	if err != nil {
+		return err
+	}
+	steps = append(steps, gateway...)
 	for _, args := range steps {
 		if err := a.runOpenClaw(args...); err != nil {
 			return fmt.Errorf("OpenClaw command %q failed: %w", strings.Join(args[:2], " "), err)
 		}
 	}
 	return nil
+}
+
+func contains(list []string, item string) bool {
+	for _, v := range list {
+		if v == item {
+			return true
+		}
+	}
+	return false
+}
+
+// chatProviderJSON declares the chat model to OpenClaw as an external
+// OpenAI-compatible server. (`onboard --non-interactive` is avoided: on Windows it
+// fails removing its own temporary SQLite file before applying anything.)
+func chatProviderJSON() string {
+	chatURL := fmt.Sprintf("http://127.0.0.1:%d/v1", llamaChatPort)
+	return fmt.Sprintf(`{"baseUrl":%q,"apiKey":"llama-cpp-local","api":"openai-completions","models":[{"id":%q,"name":"Agents-A1 4B Q4_K_M","reasoning":false,"input":["text"],"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0},"contextWindow":%d,"maxTokens":4096,"compat":{"supportsTools":true}}]}`, chatURL, chatModelID, chatContext)
+}
+
+func (a *app) openclawConfigPath() string {
+	return filepath.Join(a.runtimeDir(), "home", ".openclaw-a1", "openclaw.json")
+}
+
+var contextWindowRE = regexp.MustCompile(`"contextWindow"\s*:\s*(\d+)`)
+
+// registeredChatContext reads the context window OpenClaw has on file for the chat
+// model (0 if it cannot be determined).
+func (a *app) registeredChatContext() int {
+	data, err := os.ReadFile(a.openclawConfigPath())
+	if err != nil {
+		return 0
+	}
+	var cfg struct {
+		Models struct {
+			Providers map[string]struct {
+				Models []struct {
+					ID            string `json:"id"`
+					ContextWindow int    `json:"contextWindow"`
+				} `json:"models"`
+			} `json:"providers"`
+		} `json:"models"`
+	}
+	if json.Unmarshal(data, &cfg) == nil {
+		for _, model := range cfg.Models.Providers["llama-cpp"].Models {
+			if model.ID == chatModelID {
+				return model.ContextWindow
+			}
+		}
+	}
+	if m := contextWindowRE.FindSubmatch(data); m != nil {
+		n, _ := strconv.Atoi(string(m[1]))
+		return n
+	}
+	return 0
+}
+
+// syncChatContext makes OpenClaw's idea of the model's context window match the
+// window the server really runs. If they differ, OpenClaw mis-budgets the prompt and
+// compacts the conversation far too early, which makes replies slow. A one-off
+// `config set` can be silently lost (for example if it collides with a gateway that
+// is still shutting down), so this is checked on every start and retried.
+var ctxSyncMu sync.Mutex // the start-up check and a wake-up can both ask at once
+
+func (a *app) syncChatContext() {
+	ctxSyncMu.Lock()
+	defer ctxSyncMu.Unlock()
+	if a.registeredChatContext() == chatContext {
+		return
+	}
+	a.recordCommandOutput(fmt.Sprintf("Updating OpenClaw's context window to %d tokens", chatContext))
+	for attempt := 0; attempt < 4 && a.ctx.Err() == nil; attempt++ {
+		if err := a.runOpenClaw("config", "set", "models.providers.llama-cpp", chatProviderJSON(), "--strict-json"); err == nil && a.registeredChatContext() == chatContext {
+			a.recordCommandOutput("OpenClaw's context window is now in step with the model server")
+			return
+		}
+		select {
+		case <-a.ctx.Done():
+			return
+		case <-time.After(8 * time.Second):
+		}
+	}
+	a.recordCommandOutput("Could not update OpenClaw's context window; replies may be slower than they should be")
 }

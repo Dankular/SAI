@@ -11,6 +11,7 @@ import (
 	"io"
 	"io/fs"
 	"log"
+	"mime"
 	"net"
 	"net/http"
 	"net/url"
@@ -22,6 +23,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -46,6 +48,8 @@ type Snapshot struct {
 	ProgressStep         int      `json:"progressStep"`
 	ProgressTotal        int      `json:"progressTotal"`
 	CompletedStage       int      `json:"completedStage"`
+	StageLabels          []string `json:"stageLabels"`
+	PersonaInstalled     bool     `json:"personaInstalled"`
 	ProgressDetail       string   `json:"progressDetail,omitempty"`
 	GatewayRunning       bool     `json:"gatewayRunning"`
 	MemoryBackend        string   `json:"memoryBackend"`
@@ -66,6 +70,10 @@ type app struct {
 	gatewayLog       *os.File
 	gatewayStopped   *exec.Cmd // gateway process we deliberately stopped
 	llama            llamaState
+	audio            audioState
+	inference        cachedBool
+	gwReady          cachedBool
+	gwWarm           atomic.Bool // first agent turn done; later turns are fast
 	ctx              context.Context
 	cancel           context.CancelFunc
 	resumeSetup      bool
@@ -74,6 +82,10 @@ type app struct {
 }
 
 func main() {
+	// ES modules require a JavaScript MIME type; the Windows registry can say otherwise.
+	_ = mime.AddExtensionType(".js", "text/javascript; charset=utf-8")
+	_ = mime.AddExtensionType(".mjs", "text/javascript; charset=utf-8")
+	_ = mime.AddExtensionType(".wasm", "application/wasm")
 	dataDir, err := sovereignAIDataDir()
 	if err != nil {
 		log.Fatal(err)
@@ -115,6 +127,11 @@ func main() {
 	mux.HandleFunc("/api/openclaw", a.handleOpenClaw)
 	mux.HandleFunc("/api/workspace", a.handleWorkspace)
 	mux.HandleFunc("/api/memory", a.handleMemory)
+	mux.HandleFunc("/api/voice/chat", a.handleVoiceChat)
+	mux.HandleFunc("/api/voice/tts", a.handleTTS)
+	mux.HandleFunc("/api/voice/turn", a.handleTurn)
+	mux.HandleFunc("/api/diagnose", a.handleDiagnose)
+	mux.HandleFunc("/models/whistle/", a.handleWhistleFile)
 	mux.HandleFunc("/favicon.ico", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 	})
@@ -130,12 +147,35 @@ func main() {
 	}
 	signalCtx, stopSignal := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stopSignal()
-	go openBrowser(a.serverURL)
+	if os.Getenv("SOVEREIGNAI_NO_BROWSER") == "" {
+		go openBrowser(a.serverURL)
+	}
 	log.Printf("%s is available at %s", productName, a.serverURL)
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- server.Serve(listener) }()
 	if resumeSetup {
 		a.startSetup()
+	} else if a.state.SetupComplete {
+		// Refresh the persona files so identity and rule changes reach existing installs.
+		if err := a.writePersona(a.state.Profile); err != nil {
+			log.Printf("%s persona: %v", productName, err)
+		}
+		go a.syncChatContext()
+		go func() {
+			if err := a.startLlama(); err != nil {
+				log.Printf("%s model servers: %v", productName, err)
+			}
+		}()
+		go func() {
+			if err := a.ensureWhistle(); err != nil {
+				log.Printf("%s speech recognition model: %v", productName, err)
+			}
+		}()
+		go func() {
+			if err := a.startAudio(); err != nil {
+				log.Printf("%s voice: %v", productName, err)
+			}
+		}()
 	}
 	select {
 	case <-signalCtx.Done():
@@ -150,6 +190,7 @@ func main() {
 	a.cancel()
 	a.stopGateway()
 	a.stopLlama()
+	a.stopAudio()
 	if a.gatewayLog != nil {
 		_ = a.gatewayLog.Close()
 	}
@@ -177,7 +218,7 @@ func sovereignAIDataDir() (string, error) {
 }
 
 func (a *app) load() error {
-	a.state = Snapshot{RecentLogs: []string{}}
+	a.state = Snapshot{RecentLogs: []string{}, StageLabels: stageLabels()}
 	data, err := os.ReadFile(a.statePath)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
@@ -187,6 +228,10 @@ func (a *app) load() error {
 	}
 	if err := json.Unmarshal(data, &a.state); err != nil {
 		return fmt.Errorf("read %s state: %w", productName, err)
+	}
+	a.state.StageLabels = stageLabels()
+	if a.state.SetupComplete {
+		a.state.PersonaInstalled = true
 	}
 	a.resumeSetup = a.state.SetupRunning || (a.state.Profile.UserName != "" && a.state.Profile.AgentName != "" && a.state.Profile.Purpose != "" && !a.state.SetupComplete && a.state.Error == "")
 	a.state.SetupRunning = false
@@ -212,7 +257,7 @@ func (a *app) persistLocked() error {
 
 func (a *app) localOnly(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/" && r.URL.Path != "/style.css" && r.URL.Path != "/app.js" && r.URL.Path != "/favicon.ico" && !strings.HasPrefix(r.URL.Path, "/api/") {
+		if !publicPath(r.URL.Path) {
 			http.NotFound(w, r)
 			return
 		}
@@ -227,9 +272,12 @@ func (a *app) localOnly(next http.Handler) http.Handler {
 				return
 			}
 		}
+		w.Header().Set("Cross-Origin-Opener-Policy", "same-origin")
+		w.Header().Set("Cross-Origin-Embedder-Policy", "require-corp")
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("Referrer-Policy", "no-referrer")
-		w.Header().Set("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self'; font-src 'self'; img-src 'self' data:; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'")
+		w.Header().Set("Permissions-Policy", "microphone=(self)")
+		w.Header().Set("Content-Security-Policy", "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; font-src 'self'; img-src 'self' data:; connect-src 'self'; media-src 'self' blob:; worker-src 'self' blob:; base-uri 'none'; frame-ancestors 'none'")
 		next.ServeHTTP(w, r)
 	})
 }
@@ -254,6 +302,12 @@ func (a *app) handleState(w http.ResponseWriter, r *http.Request) {
 		OpenClawReady:   entryErr == nil,
 		GatewayPID:      a.gatewayPID(),
 		LlamaBackend:    a.llamaBackendName(),
+		AudioBackend:    a.audioBackendName(),
+		AudioReady:      a.audioReady(),
+		InferenceBusy:   a.inferenceBusy(),
+		GatewayReady:    a.gatewayReady(),
+		GatewayWarm:     a.gwWarm.Load(),
+		WhistleReady:    a.whistleReady(),
 		StateSavedAtUTC: time.Now().UTC().Format(time.RFC3339),
 	}})
 }
@@ -269,6 +323,12 @@ type runtimeStatus struct {
 	OpenClawReady   bool   `json:"openclawReady"`
 	GatewayPID      int    `json:"gatewayPid"`
 	LlamaBackend    string `json:"llamaBackend"`
+	AudioBackend    string `json:"audioBackend"`
+	AudioReady      bool   `json:"audioReady"`
+	InferenceBusy   bool   `json:"inferenceBusy"`
+	GatewayReady    bool   `json:"gatewayReady"`
+	GatewayWarm     bool   `json:"gatewayWarm"`
+	WhistleReady    bool   `json:"whistleReady"`
 	StateSavedAtUTC string `json:"time"`
 }
 
@@ -314,9 +374,14 @@ func (a *app) handleSetup(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "could not create the private Sovereign AI workspace", http.StatusInternalServerError)
 		return
 	}
-	if err := a.writePersona(p); err != nil {
-		http.Error(w, "could not save the assistant profile", http.StatusInternalServerError)
-		return
+	a.mu.Lock()
+	finished := a.state.SetupComplete
+	a.mu.Unlock()
+	if finished {
+		if err := a.writePersona(p); err != nil {
+			http.Error(w, "could not save the assistant profile", http.StatusInternalServerError)
+			return
+		}
 	}
 	a.mu.Lock()
 	a.state.Profile = p
@@ -339,28 +404,6 @@ func (a *app) handleSetup(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]any{"ok": true, "setupRunning": startSetup})
 }
 
-func (a *app) writePersona(p Profile) error {
-	if err := os.MkdirAll(filepath.Join(a.workspace, "memory"), 0700); err != nil {
-		return err
-	}
-	id := fmt.Sprintf("# Identity\n\n- Name: %s\n- Role: personal AI assistant\n", mdLine(p.AgentName))
-	soul := fmt.Sprintf("# %s\n\nYou are %s, a personal AI assistant.\n\n## Purpose\n%s\n\n## Reply style\n%s\n\nBe honest about uncertainty. Ask before taking consequential actions. Keep the user's private information within this local workspace unless the user explicitly chooses an external service.\n", mdLine(p.AgentName), mdLine(p.AgentName), mdParagraph(p.Purpose), replyPreference(p.ReplyStyle))
-	user := fmt.Sprintf("# User profile\n\n- Name: %s\n- Reply preference: %s\n\n## How the user expects to use the assistant\n%s\n\nUpdate this file when the user states a durable preference. Record explicit preferences rather than guesses, and revise or remove them when corrected.\n", mdLine(p.UserName), replyPreference(p.ReplyStyle), mdParagraph(p.Purpose))
-	memory := "# Long-term memory\n\nStore durable facts and preferences the user explicitly asks you to remember. Keep facts concise, use dates when relevant, and correct outdated entries instead of accumulating duplicates. Do not store secrets or sensitive personal details unless the user explicitly asks.\n"
-	files := map[string]string{
-		"IDENTITY.md": id,
-		"SOUL.md":     soul,
-		"USER.md":     user,
-		"MEMORY.md":   memory,
-	}
-	for name, contents := range files {
-		if err := os.WriteFile(filepath.Join(a.workspace, name), []byte(contents), 0600); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
 func (a *app) handleInstall(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -376,9 +419,9 @@ func (a *app) handleInstall(w http.ResponseWriter, r *http.Request) {
 	from, hasFrom := 0, false
 	if v := r.URL.Query().Get("from"); v != "" {
 		n, err := strconv.Atoi(v)
-		if err != nil || n < 1 || n > 10 {
+		if err != nil || n < 1 || n > len(setupStages()) {
 			a.mu.Unlock()
-			http.Error(w, "from must be a stage number from 1 to 10", http.StatusBadRequest)
+			http.Error(w, fmt.Sprintf("from must be a stage number from 1 to %d", len(setupStages())), http.StatusBadRequest)
 			return
 		}
 		from, hasFrom = n, true
@@ -390,7 +433,7 @@ func (a *app) handleInstall(w http.ResponseWriter, r *http.Request) {
 	}
 	if hasFrom {
 		a.state.SetupComplete = false
-		a.state.CompletedStage = min(from-1, lastResumableStage)
+		a.state.CompletedStage = min(from-1, lastResumableStage())
 	}
 	a.beginSetupLocked()
 	_ = a.persistLocked()
@@ -405,7 +448,7 @@ func (a *app) beginSetupLocked() {
 	a.state.ProgressPercent = 0
 	a.state.ProgressStagePercent = 0
 	a.state.ProgressStep = 0
-	a.state.ProgressTotal = 10
+	a.state.ProgressTotal = len(setupStages())
 	a.state.ProgressDetail = "Preparing automatic setup"
 	a.state.Step = "Starting Sovereign AI setup"
 	a.logLocked("Starting automatic OpenClaw and local model setup")
@@ -421,157 +464,6 @@ func (a *app) startSetup() {
 	_ = a.persistLocked()
 	a.mu.Unlock()
 	go a.bootstrap()
-}
-
-func (a *app) bootstrap() {
-	defer func() {
-		a.mu.Lock()
-		a.state.SetupRunning = false
-		_ = a.persistLocked()
-		a.mu.Unlock()
-	}()
-	if runtime.GOOS != "windows" {
-		a.fail(errors.New("the automatic OpenClaw installer currently supports Windows"))
-		return
-	}
-	if err := os.MkdirAll(a.workspace, 0700); err != nil {
-		a.fail(err)
-		return
-	}
-	const total = 10
-	if err := a.runSetupStage(1, total, "Installing a private Node.js runtime and OpenClaw", func() error {
-		if err := os.MkdirAll(a.runtimeDir(), 0700); err != nil {
-			return err
-		}
-		if err := a.ensureNode(); err != nil {
-			return fmt.Errorf("private Node.js runtime install failed: %w", err)
-		}
-		return a.ensureOpenClaw()
-	}); err != nil {
-		a.fail(fmt.Errorf("OpenClaw install failed: %w", err))
-		return
-	}
-	if err := a.runSetupStage(2, total, "Preparing the OpenClaw workspace", func() error {
-		if err := a.runOpenClaw("config", "set", "agents.defaults.workspace", a.workspace); err != nil {
-			return fmt.Errorf("setting the OpenClaw workspace failed: %w", err)
-		}
-		return nil
-	}); err != nil {
-		a.fail(err)
-		return
-	}
-	if err := a.runSetupStage(3, total, "Installing the OpenClaw llama.cpp provider", func() error {
-		return a.runOpenClaw("plugins", "install", "clawhub:@openclaw/llama-cpp-provider", "--force")
-	}); err != nil {
-		a.fail(fmt.Errorf("installing the local model provider failed: %w", err))
-		return
-	}
-	if err := a.runSetupStage(4, total, "Downloading the llama.cpp runtime for this GPU", func() error {
-		var failures []string
-		for _, backend := range a.backendCandidates() {
-			if _, err := a.ensureBackend(backend); err != nil {
-				failures = append(failures, backend+": "+err.Error())
-				continue
-			}
-			return nil
-		}
-		return errors.New(strings.Join(failures, "; "))
-	}); err != nil {
-		a.fail(fmt.Errorf("llama.cpp runtime setup failed: %w", err))
-		return
-	}
-	if err := a.runSetupStage(5, total, "Downloading Agents-A1 4B from Hugging Face", func() error {
-		return a.ensureModel(chatRepo, chatFile, a.chatModel())
-	}); err != nil {
-		a.fail(fmt.Errorf("downloading Agents-A1 4B failed: %w", err))
-		return
-	}
-	if err := a.runSetupStage(6, total, "Downloading the local memory embedding model", func() error {
-		return a.ensureModel(embedRepo, embedFile, a.embedModel())
-	}); err != nil {
-		a.fail(fmt.Errorf("downloading the embedding model failed: %w", err))
-		return
-	}
-	if err := a.runSetupStage(7, total, "Starting the local model servers and connecting OpenClaw", func() error {
-		if err := a.startLlama(); err != nil {
-			return err
-		}
-		return a.registerLocalModels()
-	}); err != nil {
-		a.fail(fmt.Errorf("local model setup failed: %w", err))
-		return
-	}
-	if err := a.runSetupStage(8, total, "Indexing the local profile and memory files", func() error {
-		return a.runOpenClaw("memory", "index", "--force")
-	}); err != nil {
-		a.fail(fmt.Errorf("memory indexing failed: %w", err))
-		return
-	}
-	if err := a.runSetupStage(9, total, "Saving the assistant persona", func() error {
-		return a.writePersona(a.profile())
-	}); err != nil {
-		a.fail(fmt.Errorf("saving persona files failed: %w", err))
-		return
-	}
-	if err := a.runSetupStage(10, total, "Starting the OpenClaw Gateway", func() error {
-		if err := a.startGateway(); err != nil {
-			return err
-		}
-		// Make sure the Gateway survives startup rather than exiting on a config error.
-		for deadline := time.Now().Add(10 * time.Second); time.Now().Before(deadline); time.Sleep(500 * time.Millisecond) {
-			a.mu.Lock()
-			alive := a.gateway != nil
-			a.mu.Unlock()
-			if !alive {
-				return fmt.Errorf("the OpenClaw Gateway exited during startup: %s", tailFile(filepath.Join(a.dataDir, "gateway.log"), 800))
-			}
-		}
-		return nil
-	}); err != nil {
-		a.fail(err)
-		return
-	}
-	a.mu.Lock()
-	a.state.SetupComplete = true
-	a.state.Step = "Your local assistant is ready"
-	a.state.ProgressPercent = 100
-	a.state.ProgressStagePercent = 100
-	a.state.ProgressStep = total
-	a.state.ProgressTotal = total
-	a.state.ProgressDetail = "All components are ready"
-	a.state.Error = ""
-	a.logLocked("OpenClaw setup completed; local memory indexing was requested")
-	_ = a.persistLocked()
-	a.mu.Unlock()
-}
-
-// lastResumableStage is the last stage whose work is a one-time install or
-// download. Stages after it (start servers, register, index, persona, gateway)
-// are cheap and depend on runtime state, so they run on every pass.
-const lastResumableStage = 6
-
-func (a *app) runSetupStage(index, total int, name string, action func() error) error {
-	a.mu.Lock()
-	done := index <= lastResumableStage && index <= a.state.CompletedStage
-	a.mu.Unlock()
-	if done {
-		a.mu.Lock()
-		a.logLocked("Already done, skipping: " + name)
-		a.mu.Unlock()
-		a.completeSetupStage(index, total)
-		return nil
-	}
-	a.setSetupStage(index, total, name)
-	if err := action(); err != nil {
-		return err
-	}
-	if index <= lastResumableStage {
-		a.mu.Lock()
-		a.state.CompletedStage = index
-		a.mu.Unlock()
-	}
-	a.completeSetupStage(index, total)
-	return nil
 }
 
 func prependPath(env []string, directory string) []string {
@@ -968,9 +860,18 @@ func (a *app) handleStart(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *app) startGateway() error {
-	if err := a.startLlama(); err != nil {
-		return fmt.Errorf("start local model servers: %w", err)
-	}
+	a.syncChatContext()
+	// The model servers load alongside the gateway instead of before it: the gateway
+	// does not need the model until the first message, and "ready" below waits for both.
+	go func() {
+		if err := a.startLlama(); err != nil {
+			a.mu.Lock()
+			a.state.Error = "Could not start the local model: " + err.Error()
+			a.logLocked(a.state.Error)
+			_ = a.persistLocked()
+			a.mu.Unlock()
+		}
+	}()
 	a.mu.Lock()
 	if a.gateway != nil && a.gateway.Process != nil {
 		a.state.GatewayRunning = true
@@ -993,9 +894,11 @@ func (a *app) startGateway() error {
 	}
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
+	a.gwWarm.Store(false)
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("start Gateway: %w", err)
 	}
+	go a.warmGateway()
 	a.mu.Lock()
 	a.gateway = cmd
 	a.state.GatewayRunning = true
@@ -1241,4 +1144,14 @@ func openBrowser(address string) {
 	if runtime.GOOS == "windows" {
 		_ = exec.Command("rundll32.exe", "url.dll,FileProtocolHandler", address).Start()
 	}
+}
+
+// publicPath lists what the local web server may serve: the embedded UI files,
+// vendored scripts, and the JSON API.
+func publicPath(p string) bool {
+	switch p {
+	case "/", "/style.css", "/dashboard.css", "/app.js", "/orb.js", "/voice.js", "/vad.js", "/stt.js", "/stt-worker.js", "/listen.js", "/capture-worklet.js", "/favicon.ico":
+		return true
+	}
+	return strings.HasPrefix(p, "/api/") || strings.HasPrefix(p, "/vendor/") || strings.HasPrefix(p, "/models/whistle/")
 }

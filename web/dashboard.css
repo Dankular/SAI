@@ -1,0 +1,196 @@
+/* Dashboard console: dark stage with the voice sphere at the centre. */
+#dashboard .console{display:grid;grid-template-columns:minmax(0,1fr) 340px;gap:20px;align-items:stretch;margin-bottom:20px}
+body.is-dashboard .starfield{display:none}
+#dashboard .stage{position:relative;display:flex;flex-direction:column;min-height:640px;padding:26px 28px 22px;border-radius:22px;overflow:hidden;
+  background:radial-gradient(120% 90% at 50% 38%,rgba(40,70,130,.28) 0%,rgba(10,14,26,.92) 58%,rgba(6,8,15,.98) 100%);
+  border:1px solid rgba(140,170,255,.14);box-shadow:0 30px 80px rgba(2,6,20,.55),inset 0 1px 0 rgba(255,255,255,.04);color:#e8edf8}
+#dashboard .stage h1{color:#f4f7ff;margin:6px 0 0}
+#dashboard .stage .eyebrow{color:#8fa3c9}
+#dashboard .stage-head{display:flex;justify-content:space-between;align-items:flex-start;gap:16px;position:relative;z-index:2}
+#dashboard .status-badge{display:inline-flex;align-items:center;gap:8px;padding:8px 14px;border-radius:999px;background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.1);color:#cdd7ee;font:500 11px 'DM Mono',monospace;letter-spacing:.8px;white-space:nowrap}
+#dashboard .status-badge span{width:8px;height:8px;border-radius:50%;background:#6b7a99}
+#dashboard .status-badge.online span{background:#52e8d4;box-shadow:0 0 0 4px rgba(82,232,212,.18)}
+
+.orb-stage{position:relative;flex:1;display:flex;flex-direction:column;align-items:center;justify-content:flex-end;min-height:460px;margin:0 -28px}
+.orb{position:absolute;inset:0;z-index:0}
+.orb canvas{display:block;width:100%;height:100%}
+.orb-caption{position:relative;z-index:1;margin-bottom:6px;text-align:center;display:grid;gap:4px;text-shadow:0 2px 14px rgba(0,0,0,.8)}
+.orb-caption b{font:600 13px 'DM Mono',monospace;letter-spacing:2.4px;text-transform:uppercase;color:#f1f5ff;transition:color .6s}
+.orb-caption small{color:#8fa3c9;font-size:13px}
+.orb-stage[data-state="active"] .orb-caption b{color:#7ef0e0}
+.orb-stage[data-state="listening"] .orb-caption b{color:#9dffc4}
+.orb-stage[data-state="working"] .orb-caption b{color:#ffa6e3}
+.orb-stage[data-state="speaking"] .orb-caption b{color:#d4f9ff}
+.orb-stage[data-state="idle"] .orb-caption b{color:#8d9ab6}
+
+/* CSS fallback when WebGL is unavailable */
+.orb-css{width:52%;aspect-ratio:1/1;margin:auto;border-radius:50%;--level:0;
+  background:radial-gradient(circle at 35% 30%,#caf8ff,#3f7bff 55%,#1d2536);filter:blur(.3px);
+  transform:scale(calc(1 + var(--level)*.18));box-shadow:0 0 calc(30px + var(--level)*90px) rgba(80,140,255,.55);transition:transform .08s}
+.orb-css[data-state="idle"]{background:radial-gradient(circle at 35% 30%,#6b7a99,#1d2536)}
+.orb-css[data-state="working"]{background:radial-gradient(circle at 35% 30%,#ff8bd8,#5b3df5)}
+.orb-css[data-state="listening"]{background:radial-gradient(circle at 35% 30%,#8dffb8,#0e9f8e)}
+
+.say-bar{display:flex;gap:10px;position:relative;z-index:2;margin-top:6px}
+.say-bar input{flex:1;height:48px;padding:0 18px;border-radius:14px;border:1px solid rgba(255,255,255,.14);background:rgba(255,255,255,.06);color:#f1f5ff;font:500 14px 'DM Sans',sans-serif;outline:none}
+.say-bar input::placeholder{color:#7f8fb0}
+.say-bar input:focus{border-color:rgba(126,240,224,.6);box-shadow:0 0 0 3px rgba(126,240,224,.12)}
+.say-bar input:disabled{opacity:.5}
+.say-bar .button{height:48px;border-radius:14px}
+.stage-actions{display:flex;flex-wrap:wrap;align-items:center;gap:10px;margin-top:14px;position:relative;z-index:2}
+.toggle{display:inline-flex;align-items:center;gap:8px;margin-left:auto;color:#aebbd8;font-size:13px;cursor:pointer}
+.toggle input{accent-color:#52e8d4}
+
+.convo{display:flex;flex-direction:column;min-height:640px;padding:20px;border-radius:22px;background:rgba(14,18,32,.86);border:1px solid rgba(140,170,255,.12);color:#e8edf8}
+.convo .panel-kicker{color:#8fa3c9}
+.convo-list{flex:1;overflow:auto;display:flex;flex-direction:column;gap:12px;margin-top:14px;padding-right:4px;max-height:560px}
+.convo-list .empty-log{color:#7f8fb0}
+.msg{max-width:92%;padding:10px 14px;border-radius:14px;font-size:14px;line-height:1.5;white-space:pre-wrap;word-break:break-word}
+.msg.user{align-self:flex-end;background:rgba(82,232,212,.14);border:1px solid rgba(82,232,212,.25);color:#e9fffb}
+.msg.agent{align-self:flex-start;background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.1);color:#e8edf8}
+.msg.agent.pending::after{content:"▍";opacity:.7;animation:blink 1s steps(2) infinite}
+.msg.error{align-self:stretch;background:rgba(255,107,107,.12);border:1px solid rgba(255,107,107,.3);color:#ffd2d2}
+@keyframes blink{50%{opacity:0}}
+
+#dashboard .dashboard-grid{grid-template-columns:repeat(3,minmax(0,1fr))}
+@media (max-width:1100px){#dashboard .console{grid-template-columns:1fr}.convo{min-height:320px}.convo-list{max-height:320px}}
+@media (max-width:760px){#dashboard .dashboard-grid{grid-template-columns:1fr}.stage{min-height:560px;padding:20px}.toggle{margin-left:0}}
+@media (prefers-reduced-motion:reduce){.msg.agent.pending::after{animation:none}}
+
+/* Cards below the console share the console's dark glass look. */
+#dashboard .dashboard-grid .panel,#dashboard .activity.panel{background:rgba(14,18,32,.86);border:1px solid rgba(140,170,255,.12);box-shadow:0 18px 50px rgba(2,6,20,.4);color:#e8edf8}
+#dashboard .dashboard-grid .panel h2,#dashboard .activity.panel h2{color:#f4f7ff}
+#dashboard .dashboard-grid .panel .muted,#dashboard .activity.panel .muted{color:#9fb0d2}
+#dashboard .dashboard-grid .panel-kicker,#dashboard .activity.panel .panel-kicker{color:#8fa3c9}
+#dashboard .text-link{color:#7ef0e0}
+#dashboard .runtime-status,#dashboard .runtime-status small{color:#aebbd8}
+#dashboard .log-row{color:#aebbd8;border-color:rgba(255,255,255,.08)}
+#dashboard .empty-log{color:#7f8fb0}
+#dashboard .activity-state{color:#cdd7ee}
+
+/* Keeps the state caption readable over the galaxy arms. */
+.orb-stage::after{content:"";position:absolute;left:0;right:0;bottom:0;height:120px;background:linear-gradient(to bottom,rgba(6,8,15,0),rgba(6,8,15,.82));pointer-events:none;z-index:0}
+
+/* Rendered markdown inside conversation bubbles. */
+.msg{white-space:normal}
+.msg p{margin:0 0 .5em}
+.msg p:last-child,.msg ul:last-child,.msg ol:last-child{margin-bottom:0}
+.msg ul,.msg ol{margin:.2em 0 .6em;padding-left:1.3em}
+.msg li{margin:.15em 0}
+.msg code{padding:.05em .35em;border-radius:5px;background:rgba(255,255,255,.1);font:12.5px 'DM Mono',monospace}
+.msg strong{color:#fff}
+
+/* Hands-free microphone controls. */
+.mic-button{display:inline-flex;align-items:center;gap:8px;height:48px;border-radius:14px;white-space:nowrap}
+.mic-dot{width:10px;height:10px;border-radius:50%;background:#7f8fb0;transition:background .3s,box-shadow .3s}
+.mic-button[aria-pressed="true"]{background:rgba(82,232,212,.16);border-color:rgba(82,232,212,.5);color:#d9fffa}
+.mic-button[aria-pressed="true"] .mic-dot{background:#52e8d4;box-shadow:0 0 0 4px rgba(82,232,212,.22)}
+.mic-button:disabled{opacity:.5}
+.listen-row{display:flex;align-items:center;justify-content:center;gap:12px;margin-top:4px}
+.listen-row.hidden{display:none}
+.listen-status{font:500 12px 'DM Mono',monospace;letter-spacing:.8px;color:#9dffc4}
+.mic-level{width:90px;height:4px;border-radius:2px;background:rgba(255,255,255,.12);overflow:hidden}
+.mic-level i{display:block;height:100%;width:0;background:#9dffc4;transition:width .06s linear}
+.msg.user.heard::before{content:"🎙 ";opacity:.8}
+
+/* ===== Overview: the sphere and the conversation side by side, fitted to the screen ===== */
+body.is-dashboard .app-footer{display:none}
+body.is-dashboard .main{display:flex;flex-direction:column;height:100vh;height:100dvh;min-height:0;max-width:none;padding-left:clamp(14px,2vw,28px);padding-right:clamp(14px,2vw,28px)}
+body.is-dashboard .topbar{flex:none;height:54px}
+#dashboard.view:not(.hidden){flex:1;min-height:0;display:flex;max-width:none;width:100%;margin:0;padding:14px 0 18px}
+#dashboard .console{flex:1;min-height:0;width:100%;margin:0;grid-template-columns:minmax(0,1fr) minmax(300px,400px);gap:16px}
+#dashboard .stage,#dashboard .convo{min-height:0;height:100%}
+#dashboard .stage{padding:20px 24px 18px}
+#dashboard .stage h1{font-size:clamp(22px,2.4vw,32px);line-height:1.1;margin:4px 0 0}
+#dashboard .stage-head{flex:none}
+.orb-stage{min-height:0;margin:0 -24px}
+.convo-list{max-height:none;min-height:0}
+.say-bar,.stage-actions{flex:none}
+.stage-actions{margin-top:12px}
+
+/* Terminal drawer in the sidebar */
+.nav-icon{flex:none}
+.terminal-toggle{margin-left:auto;display:inline-flex;align-items:center;gap:6px;padding:5px 9px;border-radius:8px;border:1px solid rgba(140,170,255,.22);background:rgba(255,255,255,.05);color:#cdd7ee;font:500 10px 'DM Mono',monospace;letter-spacing:.4px;cursor:pointer;white-space:nowrap}
+.terminal-toggle:hover{background:rgba(255,255,255,.1)}
+.terminal-toggle[aria-expanded="true"]{border-color:rgba(126,240,224,.5);color:#9dffe9}
+.terminal-icon{font-weight:700;color:#7ef0e0}
+.rail-bottom{flex-wrap:nowrap;gap:8px;font-size:11px}
+.rail-bottom-text{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.terminal-panel{margin-top:auto;display:flex;flex-direction:column;min-height:0;max-height:62%;margin-bottom:10px;padding:12px;border-radius:12px;background:rgba(8,11,20,.92);border:1px solid rgba(140,170,255,.16);color:#d5def2}
+.terminal-panel.hidden{display:none}
+.terminal-panel:not(.hidden) ~ .rail-bottom{margin-top:0}
+.terminal-head{display:flex;align-items:center;justify-content:space-between;gap:8px;flex:none}
+.terminal-head .panel-kicker{color:#8fa3c9;font-size:9px}
+.terminal-step{margin:6px 0 8px;font:600 12px 'DM Sans',sans-serif;color:#f4f7ff;line-height:1.3;flex:none}
+.terminal-panel .activity-state{font:500 9px 'DM Mono',monospace;color:#9dffc4;letter-spacing:.6px}
+.terminal-panel .activity-state.attention{color:#ffa6a6}
+.terminal-panel .inline-error{margin:0 0 8px;font-size:11px;flex:none}
+.terminal-panel .log-list{flex:1;min-height:90px;overflow:auto;display:flex;flex-direction:column;gap:3px;padding-right:2px;margin:0}
+.terminal-panel .log-row{font:10.5px/1.45 'DM Mono',monospace;color:#b9c6e2;word-break:break-word;border:0;padding:0;background:none}
+.terminal-panel .empty-log{color:#7f8fb0;font-size:11px}
+.nav-item .nav-text{white-space:nowrap}
+
+/* ---- Tablet and phone: the same two panes, stacked and fitted to the screen ---- */
+@media (max-width:1100px){
+  #dashboard .console{grid-template-columns:1fr;grid-template-rows:minmax(0,1.25fr) minmax(0,1fr);gap:12px}
+}
+@media (max-width:900px){
+  /* the sidebar is icon-only here; keep the terminal button usable */
+  .rail-bottom{font-size:0;flex-direction:column;gap:10px;padding:12px 0}
+  .rail-bottom-text,.terminal-label{display:none}
+  .terminal-toggle{margin:0;padding:7px 8px}
+  .nav-item .nav-text{display:none}
+  .nav-item{display:flex!important;justify-content:center;padding:0}
+  .terminal-panel{position:fixed;left:68px;right:0;bottom:0;margin:0;max-height:52dvh;border-radius:14px 14px 0 0;z-index:5}
+}
+@media (max-width:700px){
+  /* phone: the sidebar becomes a bottom bar; the terminal is a sheet above it */
+  .rail{inset:auto 0 0 0;width:auto;height:58px;flex-direction:row;align-items:center;padding:0 12px;gap:8px;border-right:0;border-top:1px solid rgba(255,255,255,.1);z-index:6}
+  .rail .brand{padding:0}
+  .rail .rail-label{display:none}
+  .rail nav{display:flex;flex-direction:row;flex:1;justify-content:center;gap:6px}
+  .nav-item{width:44px;height:44px}
+  .nav-item .nav-icon{font-size:19px}
+  .rail-bottom{flex-direction:row;margin:0;padding:0;border:0}
+  .terminal-panel{left:0;bottom:58px;max-height:50dvh}
+  body.is-dashboard .main{margin-left:0;padding-bottom:58px;padding-left:10px;padding-right:10px}
+  body.is-dashboard .topbar{height:46px}
+  .local-pill{display:none}
+  #dashboard.view:not(.hidden){padding:8px 0 10px}
+  #dashboard .console{grid-template-rows:minmax(0,1.3fr) minmax(0,1fr);gap:10px}
+  #dashboard .stage{padding:12px 14px 12px;border-radius:18px}
+  #dashboard .convo{padding:12px;border-radius:18px}
+  #dashboard .stage h1{font-size:20px}
+  #dashboard .stage .eyebrow{display:none}
+  #dashboard .status-badge{padding:5px 10px;font-size:10px}
+  .orb-stage{margin:0 -14px}
+  .orb-caption b{font-size:11px}.orb-caption small{font-size:12px}
+  .say-bar input{height:42px}
+  .say-bar .button,.mic-button{height:42px;padding:0 12px}
+  .stage-actions{gap:8px;margin-top:8px}
+  .stage-actions .button{padding:0 12px;height:38px;font-size:13px}
+  .toggle{margin-left:auto}
+  .listen-row{margin-top:2px}
+}
+@media (max-height:700px) and (min-width:701px){
+  #dashboard .stage h1{font-size:20px}
+  #dashboard .stage .eyebrow{display:none}
+  .orb-caption small{display:none}
+}
+
+/* ===== Secure, sovereign identity ===== */
+:root{--brand-font:Bahnschrift,'Segoe UI Variable Display','Segoe UI',system-ui,sans-serif}
+.brand{gap:10px;align-items:center}
+.brand-mark{width:40px;height:40px;border-radius:10px;background:linear-gradient(160deg,#12332f,#0b1a1f);color:#7ef0e0;border:1px solid rgba(126,240,224,.45);box-shadow:0 0 0 3px rgba(126,240,224,.07),inset 0 0 14px rgba(126,240,224,.12)}
+.wordmark{display:grid;grid-template-columns:auto auto;align-items:baseline;justify-content:start;column-gap:6px;line-height:1}
+.wordmark b{font:700 15px var(--brand-font);font-stretch:112%;letter-spacing:.17em;color:#eef6f5;text-transform:uppercase}
+.wordmark i{font:500 11px 'DM Mono',monospace;font-style:normal;letter-spacing:.14em;color:#7ef0e0;border:1px solid rgba(126,240,224,.4);border-radius:4px;padding:2px 4px}
+.wordmark small{grid-column:1/-1;margin-top:7px;font:500 8.5px 'DM Mono',monospace;letter-spacing:.2em;color:#7f93a8}
+.sov{font-family:var(--brand-font);font-weight:700;letter-spacing:.06em;text-transform:uppercase;background:linear-gradient(90deg,#eaf7f4,#7ef0e0);-webkit-background-clip:text;background-clip:text;color:transparent}
+#dashboard .stage h1,.stage h1{font-family:var(--brand-font);letter-spacing:.01em}
+@media (max-width:900px){.wordmark{display:none}.brand-mark{width:38px;height:38px}}
+.say-bar input{min-width:0}
+.rail-bottom{flex-wrap:wrap;row-gap:8px}
+.rail-bottom-text{flex:1 1 auto}
+@media (min-width:901px){.terminal-toggle{margin-left:15px}}
+@media (max-width:700px){.say-bar{gap:6px}.say-bar .button,.mic-button{padding:0 10px;font-size:12px}.rail-bottom{flex-wrap:nowrap}}

@@ -1,0 +1,3 @@
+Whistle host-side pipeline (pack.js, whistle.js, backend.js) from https://huggingface.co/mrfakename/whistle-ONNX
+Export of Cactus-Compute/whistle (https://huggingface.co/Cactus-Compute/whistle). Licensed Apache-2.0.
+Vendored unmodified.
