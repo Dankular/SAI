@@ -105,6 +105,8 @@ func newSupervisor(logf func(string), setErr func(string)) *supervisor {
 
 // add registers a service. Services must be added in dependency order (needs first).
 func (s *supervisor) add(svc *managedService) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	svc.state = svcStopped
 	svc.needGen = map[string]int{}
 	for _, need := range svc.needs {

@@ -378,3 +378,46 @@ func TestHTMLToText(t *testing.T) {
 		t.Errorf("got %q", got)
 	}
 }
+
+// A small model sometimes calls remember to answer a recall question. The answer is already in the
+// notes, so nothing may be written; a genuinely new fact still is.
+func TestRememberSkipsFactsThatAreAlreadyInTheNotes(t *testing.T) {
+	a := newTestApp(t)
+	_ = a.writePersona(Profile{UserName: "Ada", AgentName: "Sam", Purpose: "planning"})
+	_ = os.MkdirAll(filepath.Join(a.workspace, "memory"), 0700)
+	_ = os.WriteFile(filepath.Join(a.workspace, "memory", "2026-10-01.md"), []byte("# Notes\n\n- Ada's neighbour Priya waters the plants while she is away.\n- The Rotterdam trip budget was 1,800 euros.\n"), 0600)
+	ctx := context.Background()
+	for _, restated := range []string{"Priya waters the plants when I'm traveling.", "Rotterdam trip budget: 1,800 euros."} {
+		if out, _ := toolRemember(ctx, a, map[string]any{"text": restated, "file": "user"}); !strings.Contains(out, "Nothing was added") {
+			t.Errorf("%q should have been recognised as known, got %q", restated, out)
+		}
+	}
+	user, _ := os.ReadFile(filepath.Join(a.workspace, "USER.md"))
+	if strings.Contains(string(user), "Priya") || strings.Contains(string(user), "Rotterdam") {
+		t.Errorf("a known fact was written again:\n%s", user)
+	}
+	if out, _ := toolRemember(ctx, a, map[string]any{"text": "Prefers tea over coffee", "file": "user"}); !strings.Contains(out, "Saved") {
+		t.Errorf("a new fact must be saved, got %q", out)
+	}
+}
+
+// Anything secret-looking from the notes must never leave in a web query or address.
+func TestWebToolsRefuseToSendSecretsFromTheNotes(t *testing.T) {
+	a := newTestApp(t)
+	_ = a.writePersona(Profile{UserName: "Ada", AgentName: "Sam", Purpose: "planning"})
+	_ = os.MkdirAll(filepath.Join(a.workspace, "memory"), 0700)
+	_ = os.WriteFile(filepath.Join(a.workspace, "memory", "n.md"), []byte("# Notes\n\n- The cottage wifi password is bluewhale42.\n- Ordered 2000 screws.\n"), 0600)
+	ctx := context.Background()
+	if _, err := toolWebSearch(ctx, a, map[string]any{"query": "Cornwall cottage wifi password bluewhale42"}); err == nil || !strings.Contains(err.Error(), "private information") {
+		t.Errorf("a query carrying the password must be refused, got %v", err)
+	}
+	if _, err := toolWebFetch(ctx, a, map[string]any{"url": "https://example.com/?p=BlueWhale42"}); err == nil || !strings.Contains(err.Error(), "private information") {
+		t.Errorf("an address carrying the password must be refused, got %v", err)
+	}
+	if err := a.refuseToSendSecrets("how many screws are in a box of 2000"); err != nil {
+		t.Errorf("ordinary numbers and words must not be blocked: %v", err)
+	}
+	if err := a.refuseToSendSecrets("what is the capital of Portugal"); err != nil {
+		t.Errorf("an ordinary query must not be blocked: %v", err)
+	}
+}

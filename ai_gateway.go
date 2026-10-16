@@ -106,6 +106,10 @@ func (a *app) modelGatewayHooks() []modelGatewayHook {
 }
 
 func (a *app) marketplacePreflight(ctx context.Context, call *modelGatewayCall) error {
+	return a.marketplacePreflightWith(ctx, call, a.discoverMCPServers)
+}
+
+func (a *app) marketplacePreflightWith(ctx context.Context, call *modelGatewayCall, discover func(context.Context, string) (string, error)) error {
 	if call.Step != 0 || strings.TrimSpace(call.UserText) == "" || explicitlyAvoidsMarketplace(call.UserText) {
 		return nil
 	}
@@ -123,7 +127,7 @@ func (a *app) marketplacePreflight(ctx context.Context, call *modelGatewayCall) 
 	}
 
 	searchCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
-	result, err := a.discoverMCPServers(searchCtx, clipText(strings.TrimSpace(call.UserText), 180))
+	result, err := discover(searchCtx, clipText(strings.TrimSpace(call.UserText), 180))
 	cancel()
 	if err != nil || strings.TrimSpace(result) == "" {
 		return nil // marketplace outages must not block the user's task

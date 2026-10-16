@@ -34,31 +34,17 @@ func (a *app) ensureWorkspaceUserland() error {
 	}
 
 	archive := filepath.Join(a.runtimeDir(), "downloads", "msys2-base-"+userlandRelease+".sfx.exe")
-	checksum := archive + ".sha256"
 	if !isFile(archive) {
 		if err := a.downloadFile(msys2BaseURL, archive, "workspace POSIX userland"); err != nil {
 			return err
 		}
 	}
-	if !isFile(checksum) {
-		if err := a.downloadFile(msys2BaseURL+".sha256", checksum, "workspace userland checksum"); err != nil {
-			return err
-		}
-	}
-	wantData, err := os.ReadFile(checksum)
-	if err != nil {
-		return err
-	}
-	fields := strings.Fields(string(wantData))
-	if len(fields) == 0 {
-		return errors.New("workspace userland checksum response was empty")
-	}
-	want := strings.ToLower(fields[0])
 	got, err := fileSHA256(archive)
 	if err != nil {
 		return err
 	}
-	if len(want) != 64 || got != want {
+	if got != userlandSHA256 {
+		_ = os.Remove(archive) // a bad or truncated download must not be reused
 		return errors.New("workspace userland archive failed its SHA-256 check")
 	}
 
@@ -98,7 +84,6 @@ func (a *app) ensureWorkspaceUserland() error {
 		return err
 	}
 	_ = os.Remove(archive)
-	_ = os.Remove(checksum)
 	return nil
 }
 

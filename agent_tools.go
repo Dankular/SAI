@@ -206,13 +206,13 @@ func (a *app) agentTools() []agentTool {
 		},
 		{
 			Name:        "memory_search",
-			Description: "Search workspace files, saved conversations, and memory by meaning.",
+			Description: "Look up what you already know: anything the user told you before, their notes, plans, people and past conversations. Use this FIRST for any question about the user's own life or about something said earlier.",
 			Parameters:  obj([]string{"query"}, map[string]any{"query": str("What to look for")}),
 			Run:         toolMemorySearch,
 		},
 		{
 			Name:        "remember",
-			Description: "Save a lasting fact or preference. Use file \"user\" for facts about the person (name, family, habits, preferences) and \"memory\" for everything else worth keeping. Keep it to one short sentence.",
+			Description: "Save a NEW lasting fact, only when the user asks you to remember something or tells you a new fact about themselves. Never use it to answer a question. File \"user\" is for facts about the person, \"memory\" for everything else. One short sentence.",
 			Parameters:  obj([]string{"text"}, map[string]any{"text": str("The fact to keep"), "file": map[string]any{"type": "string", "enum": []string{"user", "memory"}, "description": "Where to keep it"}}),
 			Run:         toolRemember,
 		},
@@ -509,6 +509,9 @@ func fetchPublic(ctx context.Context, rawURL string, limit int64) (string, strin
 }
 
 func toolWebFetch(ctx context.Context, a *app, args map[string]any) (string, error) {
+	if err := a.refuseToSendSecrets(argString(args, "url")); err != nil {
+		return "", err
+	}
 	body, contentType, err := fetchPublic(ctx, argString(args, "url"), 2<<20)
 	if err != nil {
 		return "", err
@@ -531,6 +534,9 @@ func toolWebSearch(ctx context.Context, a *app, args map[string]any) (string, er
 	query := strings.TrimSpace(argString(args, "query"))
 	if query == "" {
 		return "", errors.New("no search words given")
+	}
+	if err := a.refuseToSendSecrets(query); err != nil {
+		return "", err
 	}
 	body, _, err := fetchPublic(ctx, "https://html.duckduckgo.com/html/?q="+url.QueryEscape(query), 1<<20)
 	if err != nil {
@@ -582,8 +588,8 @@ func toolRemember(ctx context.Context, a *app, args map[string]any) (string, err
 	}
 	path := filepath.Join(a.workspace, name)
 	existing, _ := os.ReadFile(path)
-	if strings.Contains(string(existing), text) {
-		return "Already remembered.", nil
+	if strings.Contains(string(existing), text) || a.alreadyKnown(text) {
+		return "Already remembered. Nothing was added.", nil
 	}
 	prefix := ""
 	if len(existing) > 0 && !bytes.HasSuffix(existing, []byte("\n")) {
@@ -599,6 +605,93 @@ func toolRemember(ctx context.Context, a *app, args map[string]any) (string, err
 	}
 	a.memoryDirty()
 	return "Saved to " + name + ".", nil
+}
+
+// secretLike reports tokens that look like passwords, codes or account numbers: six or more letters and
+// digits with at least one of each (a lone number or a lone word is not enough to be a secret).
+func secretLikeTokens(s string) map[string]bool {
+	out := map[string]bool{}
+	for _, w := range strings.FieldsFunc(strings.ToLower(s), func(r rune) bool { return !(r >= 'a' && r <= 'z' || r >= '0' && r <= '9') }) {
+		if len(w) < 6 {
+			continue
+		}
+		letters, digits := 0, 0
+		for _, r := range w {
+			if r >= '0' && r <= '9' {
+				digits++
+			} else {
+				letters++
+			}
+		}
+		if letters > 0 && digits > 0 {
+			out[w] = true
+		}
+	}
+	return out
+}
+
+// refuseToSendSecrets stops a web search or fetch that carries something secret-looking from the user's
+// notes. The text of a query leaves the computer, and a small model will happily paste a password it has
+// in front of it into a search box.
+func (a *app) refuseToSendSecrets(outgoing string) error {
+	candidates := secretLikeTokens(outgoing)
+	if len(candidates) == 0 {
+		return nil
+	}
+	for _, file := range a.memoryFiles() {
+		data, err := os.ReadFile(file)
+		if err != nil {
+			continue
+		}
+		for token := range secretLikeTokens(string(data)) {
+			if candidates[token] {
+				return errors.New("that contains private information from the user's notes, so it was not sent over the internet. Answer from the notes instead of searching")
+			}
+		}
+	}
+	return nil
+}
+
+var noteStopwords = map[string]bool{"the": true, "and": true, "that": true, "with": true, "when": true, "you": true, "your": true, "are": true, "for": true, "was": true, "has": true, "have": true, "his": true, "her": true, "from": true, "they": true, "their": true, "this": true, "while": true, "who": true, "what": true, "which": true, "will": true}
+
+func significantWords(s string) map[string]bool {
+	words := map[string]bool{}
+	for _, w := range strings.FieldsFunc(strings.ToLower(s), func(r rune) bool { return !(r >= 'a' && r <= 'z' || r >= '0' && r <= '9') }) {
+		if len(w) >= 3 && !noteStopwords[w] {
+			words[w] = true
+		}
+	}
+	return words
+}
+
+// alreadyKnown reports whether a fact is already in the memory files. A small model sometimes calls
+// remember to answer a question, which would write the answer back as a new note; this keeps the
+// files from filling with copies. It is deliberately about wording, not meaning, so a genuinely new
+// fact is never dropped.
+func (a *app) alreadyKnown(text string) bool {
+	words := significantWords(text)
+	if len(words) < 2 {
+		return false
+	}
+	for _, file := range a.memoryFiles() {
+		data, err := os.ReadFile(file)
+		if err != nil {
+			continue
+		}
+		for _, passage := range splitPassages(string(data)) {
+			have := significantWords(passage)
+			hits := 0
+			for w := range words {
+				if have[w] {
+					hits++
+				}
+			}
+			if hits*4 >= len(words)*3 {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func toolReadSkill(ctx context.Context, a *app, args map[string]any) (string, error) {
