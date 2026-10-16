@@ -242,7 +242,25 @@ func (a *app) runTurn(ctx context.Context, opt turnOptions, emit func(agentEvent
 	return a.runTurnObserved(ctx, opt, emit, nil)
 }
 
-func (a *app) runTurnObserved(ctx context.Context, opt turnOptions, emit func(agentEvent), observe func(string, []chatMsg, int, error)) (runErr error) {
+func (a *app) runTurnObserved(ctx context.Context, opt turnOptions, emit func(agentEvent), observe func(string, []chatMsg, int, error)) error {
+	// "Do this, then do that" runs as separate turns so each part gets the model's full attention.
+	if steps := splitSteps(opt.Text); len(steps) > 1 {
+		for i, step := range steps {
+			o := opt
+			o.Text = step
+			if i > 0 {
+				emit(agentEvent{Delta: "\n"})
+			}
+			if err := a.runSingleTurn(ctx, o, emit, observe); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	return a.runSingleTurn(ctx, opt, emit, observe)
+}
+
+func (a *app) runSingleTurn(ctx context.Context, opt turnOptions, emit func(agentEvent), observe func(string, []chatMsg, int, error)) (runErr error) {
 	s := a.session(opt.Session)
 	s.mu.Lock()
 	turnStart := len(s.msgs)
@@ -267,6 +285,24 @@ func (a *app) runTurnObserved(ctx context.Context, opt turnOptions, emit func(ag
 	}
 
 	s.msgs = append(s.msgs, chatMsg{Role: "user", Content: opt.Text})
+
+	// The harness settles what it can without the model (see harness.go) and tidies what the model says.
+	a.ensureHarness()
+	plan := a.harnessPlan(opt.Text, time.Now())
+	a.setHarnessPlan(s.key, plan)
+	if plan.Forget != "" {
+		if purged := purgeSession(s, plan.Forget); purged > 0 && !plan.Wrote {
+			plan.Direct = "Done. I've forgotten that."
+		}
+	}
+	if plan.Direct != "" {
+		s.msgs = append(s.msgs, chatMsg{Role: "assistant", Content: plan.Direct})
+		emit(agentEvent{Delta: plan.Direct})
+		return nil
+	}
+	filter := newReplyFilter(opt.Spoken, plan.Wrote, emit)
+	emit = filter.Event
+	defer filter.Finish()
 	routeContext := recentRouteContext(s.msgs[:turnStart])
 	system := a.systemPrompt(time.Now())
 	if memories, err := a.searchMemory(ctx, opt.Text, 8); err == nil {
@@ -289,7 +325,7 @@ func (a *app) runTurnObserved(ctx context.Context, opt turnOptions, emit func(ag
 		if err != nil {
 			return err
 		}
-		assistant := chatMsg{Role: "assistant", Content: reply, ToolCalls: calls}
+		assistant := chatMsg{Role: "assistant", Content: tidyReply(reply, opt.Spoken, filter.rules.wrote()), ToolCalls: calls}
 		s.msgs = append(s.msgs, assistant)
 		if len(calls) == 0 {
 			if strings.TrimSpace(reply) == "" {

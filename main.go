@@ -70,6 +70,7 @@ type app struct {
 	mu               sync.Mutex
 	workMu           sync.Mutex
 	agent            agentRuntime
+	harness          harnessRuntime
 	marketplace      marketplaceRuntime
 	widget           widgetRuntime
 	orbShown         orbMirror // what the dashboard's sphere is showing, so the desktop widget can match it

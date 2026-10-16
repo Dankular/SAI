@@ -16,6 +16,7 @@ persistent vector store. Source files are in the repository root, one concern pe
 - `agent.go` — the agent loop: prompt assembly, history fitting, streaming model calls, tool execution, approvals, saved sessions
 - `ai_gateway.go` — local model-call hooks, streamed generation events, and local marketplace intent routing
 - `agent_tools.go` — the tools the model can call; each has a `Guard` that decides when the user must approve
+- `harness.go` — what the program settles before the model sees a message: exact answers, memory writes (save, update, forget), facts the user volunteers, tool selection, compound requests, web prefetch; `harness_reply.go` tidies the streamed reply; `harness_recall.go` answers questions from the notes and maps mangled paths into the workspace; `harness_web.go` is web search (several sources) and weather. Prefer adding logic here over adding prose to the prompt
 - `skills.go` — `SKILL.md` discovery and loading
 - `memory.go` — persistent semantic search over workspace text, saved conversations and memory events, with a word-match fallback
 - `memory_events.go` — evidence-checked event extraction and the append-only memory event history

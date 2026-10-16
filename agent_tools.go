@@ -229,6 +229,10 @@ func (a *app) agentTools() []agentTool {
 
 // resolvePath returns an absolute path and whether it lies inside the workspace.
 func (a *app) resolvePath(p string) (string, bool) {
+	return a.resolvePathRaw(a.agentPath(p))
+}
+
+func (a *app) resolvePathRaw(p string) (string, bool) {
 	p = strings.TrimSpace(p)
 	if p == "" {
 		return a.workspace, true
@@ -486,6 +490,11 @@ func htmlToText(page string) string {
 }
 
 func fetchPublic(ctx context.Context, rawURL string, limit int64) (string, string, error) {
+	return fetchPublicAs(ctx, rawURL, "Mozilla/5.0 (Windows NT 10.0; Win64; x64) SovereignAI/1.0", limit)
+}
+
+// fetchPublicAs is fetchPublic with a chosen User-Agent (some plain-text services only answer command-line clients).
+func fetchPublicAs(ctx context.Context, rawURL, userAgent string, limit int64) (string, string, error) {
 	u, err := url.Parse(strings.TrimSpace(rawURL))
 	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
 		return "", "", errors.New("give a full http or https address")
@@ -494,7 +503,7 @@ func fetchPublic(ctx context.Context, rawURL string, limit int64) (string, strin
 	if err != nil {
 		return "", "", err
 	}
-	request.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) SovereignAI/1.0")
+	request.Header.Set("User-Agent", userAgent)
 	request.Header.Set("Accept", "text/html,text/plain,application/json;q=0.9,*/*;q=0.5")
 	response, err := publicOnlyClient().Do(request)
 	if err != nil {
@@ -538,26 +547,7 @@ func toolWebSearch(ctx context.Context, a *app, args map[string]any) (string, er
 	if err := a.refuseToSendSecrets(query); err != nil {
 		return "", err
 	}
-	body, _, err := fetchPublic(ctx, "https://html.duckduckgo.com/html/?q="+url.QueryEscape(query), 1<<20)
-	if err != nil {
-		return "", err
-	}
-	var b strings.Builder
-	n := 0
-	for _, m := range ddgResultRE.FindAllStringSubmatch(body, 8) {
-		link := html.UnescapeString(m[1])
-		if r := ddgRedirectR.FindStringSubmatch(link); r != nil {
-			if decoded, err := url.QueryUnescape(r[1]); err == nil {
-				link = decoded
-			}
-		}
-		n++
-		fmt.Fprintf(&b, "%d. %s\n   %s\n   %s\n", n, htmlToText(m[2]), link, htmlToText(m[3]))
-	}
-	if n == 0 {
-		return "No results. Try different words.", nil
-	}
-	return b.String(), nil
+	return a.webSearch(ctx, query)
 }
 
 // --- memory and skills -------------------------------------------------------

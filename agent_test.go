@@ -95,7 +95,7 @@ func TestAgentLoopRunsToolsThenAnswers(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := replyText(events); got != "Let me look. The code word is pelican." {
+	if got := replyText(events); got != "The code word is pelican." { // the harness drops the narration "Let me look."
 		t.Errorf("reply = %q", got)
 	}
 	var tool *agentEvent

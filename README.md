@@ -190,6 +190,23 @@ also write skills for itself with `write_file`. Skills in the OpenClaw/Claude `S
 all saved conversations, and memory events with the local embedding model, and falls back to matching words if
 the embedding server is not running.
 
+**The harness: what the program does so the model doesn't have to.** The model is only about a billion
+parameters, so the app does the exact and mechanical jobs itself, in plain code (`harness*.go`):
+
+- **Exact answers without the model:** the time and date, arithmetic ("what's 18% of 250, then 12 times 12"),
+  and the current weather for a named place are answered directly and instantly.
+- **Memory by code:** "remember that my car service is on 12 December", "actually it's the 14th" (it replaces the old
+  note), "forget about the car service" (removes the note *and* the earlier chat about it), and facts you simply
+  mention ("I'm allergic to shellfish, and my dog is called Biscuit") are saved, updated and removed by the program.
+  Questions the notes can answer ("what is my dog called?") are answered from the notes.
+- **Right tools only:** each message gets only the tools that make sense for it, so the model rarely picks a wrong one.
+- **Step by step:** "do this, then do that" runs as separate turns, one task at a time.
+- **Web lookups done for it:** for "latest / current / news" questions the program runs the search and hands over
+  the results. If the search fails the model is told so and says it could not check. Nothing secret-looking from your
+  notes is ever put in a search.
+- **A tidy answer:** narration ("I'll look that up"), repeats, markdown in spoken answers, and claims of having saved
+  something that was not saved are removed as the reply streams.
+
 **Speed.** Replies use speculative decoding (the DSpark draft) when the model server supports it; if it does
 not, the app logs why and runs without it. `SOVEREIGNAI_NO_DRAFT=1` turns it off.
 
