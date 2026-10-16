@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"embed"
@@ -54,6 +53,14 @@ type Snapshot struct {
 	GatewayRunning       bool     `json:"gatewayRunning"`
 	MemoryBackend        string   `json:"memoryBackend"`
 	MemoryRunning        bool     `json:"memoryRunning"`
+	Updating             bool     `json:"updating"`      // an existing install is fetching what this release adds
+	WidgetEnabled        bool     `json:"widgetEnabled"` // show the sphere on the desktop
+	WidgetCorner         string   `json:"widgetCorner"`  // top-right (default), top-left, bottom-left, bottom-right
+	WidgetSize           string   `json:"widgetSize"`    // small, medium (default), large
+	WidgetPositionSet    bool     `json:"widgetPositionSet,omitempty"`
+	WidgetPositionX      float64  `json:"widgetPositionX,omitempty"` // normalized across the primary work area
+	WidgetPositionY      float64  `json:"widgetPositionY,omitempty"`
+	Schema               int      `json:"schema"` // version of the setup stage table the saved progress refers to
 	Step                 string   `json:"step"`
 	Error                string   `json:"error,omitempty"`
 	RecentLogs           []string `json:"recentLogs"`
@@ -61,19 +68,22 @@ type Snapshot struct {
 
 type app struct {
 	mu               sync.Mutex
+	workMu           sync.Mutex
+	agent            agentRuntime
+	marketplace      marketplaceRuntime
+	widget           widgetRuntime
+	orbShown         orbMirror // what the dashboard's sphere is showing, so the desktop widget can match it
+	stateEvents      stateEventHub
+	work             agentWorkStatus
 	state            Snapshot
 	statePath        string
 	dataDir          string
 	workspace        string
 	serverURL        string
-	gateway          *exec.Cmd
-	gatewayLog       *os.File
-	gatewayStopped   *exec.Cmd // gateway process we deliberately stopped
 	llama            llamaState
 	audio            audioState
 	inference        cachedBool
-	gwReady          cachedBool
-	gwWarm           atomic.Bool // first agent turn done; later turns are fast
+	agentWarm        atomic.Bool // the model has answered once since it started, so the next turn is quick
 	sup              *supervisor
 	serviceError     bool // state.Error was set by the supervisor
 	ctx              context.Context
@@ -95,6 +105,9 @@ func main() {
 	if err := os.MkdirAll(dataDir, 0700); err != nil {
 		log.Fatal(err)
 	}
+	if !bindChildrenToUs() {
+		log.Printf("%s could not tie its child processes to itself; they may outlive it if it is killed", productName)
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	a := &app{
 		dataDir:   dataDir,
@@ -109,8 +122,9 @@ func main() {
 	resumeSetup := a.resumeSetup
 	a.sup = a.newAppSupervisor()
 	// Anything still listening on our ports belongs to an earlier run that did not exit cleanly.
-	evictOrphans([]int{llamaChatPort, llamaEmbedPort, audioPort, gatewayPort}, a.recordCommandOutput)
+	evictOrphans([]int{llamaChatPort, llamaEmbedPort, audioPort}, a.recordCommandOutput)
 	go a.sup.Run()
+	go a.watchStateChanges()
 
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -126,13 +140,16 @@ func main() {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/state", a.handleState)
+	mux.HandleFunc("/api/events", a.handleEvents)
 	mux.HandleFunc("/api/setup", a.handleSetup)
 	mux.HandleFunc("/api/install", a.handleInstall)
 	mux.HandleFunc("/api/start", a.handleStart)
 	mux.HandleFunc("/api/stop", a.handleStop)
-	mux.HandleFunc("/api/openclaw", a.handleOpenClaw)
 	mux.HandleFunc("/api/workspace", a.handleWorkspace)
-	mux.HandleFunc("/api/memory", a.handleMemory)
+	mux.HandleFunc("/api/widget", a.handleWidget)
+	mux.HandleFunc("/api/orb", a.handleOrb)
+	mux.HandleFunc("/api/agent/approve", a.handleApprove)
+	mux.HandleFunc("/api/agent/reset", a.handleAgentReset)
 	mux.HandleFunc("/api/voice/chat", a.handleVoiceChat)
 	mux.HandleFunc("/api/voice/tts", a.handleTTS)
 	mux.HandleFunc("/api/voice/turn", a.handleTurn)
@@ -166,8 +183,7 @@ func main() {
 		if err := a.writePersona(a.state.Profile); err != nil {
 			log.Printf("%s persona: %v", productName, err)
 		}
-		go a.syncChatContext()
-		a.superviseInstalled()
+		go a.repairInstall()
 	}
 	select {
 	case <-signalCtx.Done():
@@ -181,9 +197,6 @@ func main() {
 	shutdownCancel()
 	a.cancel()
 	a.sup.Shutdown()
-	if a.gatewayLog != nil {
-		_ = a.gatewayLog.Close()
-	}
 }
 
 func sovereignAIDataDir() (string, error) {
@@ -207,6 +220,9 @@ func sovereignAIDataDir() (string, error) {
 	return dataDir, nil
 }
 
+// stateSchema changes whenever the meaning of the saved setup progress changes.
+const stateSchema = 3
+
 func (a *app) load() error {
 	a.state = Snapshot{RecentLogs: []string{}, StageLabels: stageLabels()}
 	data, err := os.ReadFile(a.statePath)
@@ -220,16 +236,28 @@ func (a *app) load() error {
 		return fmt.Errorf("read %s state: %w", productName, err)
 	}
 	a.state.StageLabels = stageLabels()
+	if a.state.Schema < stateSchema {
+		// The stage list changed since this was saved, so its progress counters mean something else now.
+		// The one-time stages only skip work that already exists, so re-checking them is quick.
+		a.state.CompletedStage = 0
+		a.state.Schema = stateSchema
+		if a.state.SetupComplete {
+			a.state.ProgressStep, a.state.ProgressTotal = len(a.state.StageLabels), len(a.state.StageLabels)
+		}
+	}
 	if a.state.SetupComplete {
 		a.state.PersonaInstalled = true
+		// An error saved by an earlier run is history, not the current state; live problems are
+		// reported again by the process manager.
+		a.state.Error = ""
+		a.state.Step = "Your local assistant is ready"
 	}
+	a.state.Updating = false
 	a.resumeSetup = a.state.SetupRunning || (a.state.Profile.UserName != "" && a.state.Profile.AgentName != "" && a.state.Profile.Purpose != "" && !a.state.SetupComplete && a.state.Error == "")
 	a.state.SetupRunning = false
 	a.state.GatewayRunning = false
 	a.state.MemoryRunning = false
-	if a.state.MemoryBackend == "" {
-		a.state.MemoryBackend = "memory-core"
-	}
+	a.state.MemoryBackend = "chromem-go"
 	return nil
 }
 
@@ -272,38 +300,6 @@ func (a *app) localOnly(next http.Handler) http.Handler {
 	})
 }
 
-func (a *app) handleState(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	_, entryErr := a.openclawEntry()
-	writeJSON(w, struct {
-		Snapshot
-		Agent    agentStatus     `json:"agent"`
-		Services []serviceStatus `json:"services"`
-		Runtime  runtimeStatus   `json:"runtime"`
-	}{a.authoritativeSnapshot(), a.sup.Agent(), a.sup.Status(), runtimeStatus{
-		PID:             os.Getpid(),
-		Executable:      executablePath(),
-		DataDir:         a.dataDir,
-		RuntimeDir:      a.runtimeDir(),
-		NodeInstalled:   isFile(a.nodeExe()),
-		OpenClawReady:   entryErr == nil,
-		GatewayPID:      a.gatewayPID(),
-		LlamaBackend:    a.llamaBackendName(),
-		AudioBackend:    a.audioBackendName(),
-		AudioReady:      a.audioReady(),
-		InferenceBusy:   a.inferenceBusy(),
-		GatewayReady:    a.gatewayReady(),
-		GatewayWarm:     a.gwWarm.Load(),
-		WhistleReady:    a.whistleReady(),
-		StateSavedAtUTC: time.Now().UTC().Format(time.RFC3339),
-	}})
-}
-
 // runtimeStatus describes the running process and its private runtime, for
 // diagnostics via /api/state.
 type runtimeStatus struct {
@@ -311,14 +307,11 @@ type runtimeStatus struct {
 	Executable      string `json:"executable"`
 	DataDir         string `json:"dataDir"`
 	RuntimeDir      string `json:"runtimeDir"`
-	NodeInstalled   bool   `json:"nodeInstalled"`
-	OpenClawReady   bool   `json:"openclawReady"`
-	GatewayPID      int    `json:"gatewayPid"`
 	LlamaBackend    string `json:"llamaBackend"`
 	AudioBackend    string `json:"audioBackend"`
 	AudioReady      bool   `json:"audioReady"`
 	InferenceBusy   bool   `json:"inferenceBusy"`
-	GatewayReady    bool   `json:"gatewayReady"`
+	AgentReady      bool   `json:"agentReady"`
 	GatewayWarm     bool   `json:"gatewayWarm"`
 	WhistleReady    bool   `json:"whistleReady"`
 	StateSavedAtUTC string `json:"time"`
@@ -330,14 +323,6 @@ func executablePath() string {
 		return ""
 	}
 	return path
-}
-
-// gatewayPID must be called with a.mu held.
-func (a *app) gatewayPID() int {
-	if a.gateway != nil && a.gateway.Process != nil {
-		return a.gateway.Process.Pid
-	}
-	return 0
 }
 
 func (a *app) handleSetup(w http.ResponseWriter, r *http.Request) {
@@ -443,7 +428,7 @@ func (a *app) beginSetupLocked() {
 	a.state.ProgressTotal = len(setupStages())
 	a.state.ProgressDetail = "Preparing automatic setup"
 	a.state.Step = "Starting Sovereign AI setup"
-	a.logLocked("Starting automatic OpenClaw and local model setup")
+	a.logLocked("Starting automatic local model setup")
 }
 
 func (a *app) startSetup() {
@@ -501,11 +486,32 @@ func setEnvValue(env []string, name, value string) []string {
 func (a *app) downloadFile(source, destination, label string) error {
 	requestCtx, cancel := context.WithTimeout(a.ctx, 4*time.Hour)
 	defer cancel()
-	request, err := http.NewRequestWithContext(requestCtx, http.MethodGet, source, nil)
-	if err != nil {
+	if err := os.MkdirAll(filepath.Dir(destination), 0700); err != nil {
 		return err
 	}
-	response, err := http.DefaultClient.Do(request)
+	// A partly downloaded file is kept and continued, so an interruption (or closing the app)
+	// does not cost the whole download again.
+	tmp := destination + ".download"
+	var have int64
+	if info, err := os.Stat(tmp); err == nil {
+		have = info.Size()
+	}
+	get := func(from int64) (*http.Response, error) {
+		request, err := http.NewRequestWithContext(requestCtx, http.MethodGet, source, nil)
+		if err != nil {
+			return nil, err
+		}
+		if from > 0 {
+			request.Header.Set("Range", fmt.Sprintf("bytes=%d-", from))
+		}
+		return http.DefaultClient.Do(request)
+	}
+	response, err := get(have)
+	if err == nil && have > 0 && response.StatusCode == http.StatusRequestedRangeNotSatisfiable {
+		response.Body.Close()
+		have = 0 // the partial file is not usable; start again
+		response, err = get(0)
+	}
 	if err != nil {
 		return fmt.Errorf("download %s: %w", label, err)
 	}
@@ -513,18 +519,30 @@ func (a *app) downloadFile(source, destination, label string) error {
 	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
 		return fmt.Errorf("download %s: server returned %s", label, response.Status)
 	}
-	if err := os.MkdirAll(filepath.Dir(destination), 0700); err != nil {
-		return err
+	flags := os.O_CREATE | os.O_WRONLY
+	total := response.ContentLength
+	var received int64
+	if response.StatusCode == http.StatusPartialContent && have > 0 {
+		flags |= os.O_APPEND
+		received = have
+		if total > 0 {
+			total += have
+		}
+	} else {
+		flags |= os.O_TRUNC // the server sent the whole file
 	}
-	tmp := destination + ".download"
-	file, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0600)
+	file, err := os.OpenFile(tmp, flags, 0600)
 	if err != nil {
 		return err
 	}
-	defer os.Remove(tmp)
 	defer file.Close()
+	complete := false
+	defer func() {
+		if !complete && received == 0 {
+			os.Remove(tmp)
+		}
+	}()
 
-	var received int64
 	lastPercent := -1
 	lastUnknownReport := int64(-1)
 	buffer := make([]byte, 32*1024)
@@ -539,13 +557,13 @@ func (a *app) downloadFile(source, destination, label string) error {
 			if written != count {
 				return io.ErrShortWrite
 			}
-			if response.ContentLength > 0 {
-				percent := int(received * 100 / response.ContentLength)
+			if total > 0 {
+				percent := int(received * 100 / total)
 				if percent > 100 {
 					percent = 100
 				}
 				if percent != lastPercent && (percent == 100 || percent%5 == 0) {
-					a.recordDownloadProgress(label, received, response.ContentLength, percent)
+					a.recordDownloadProgress(label, received, total, percent)
 					lastPercent = percent
 				}
 			} else if received-lastUnknownReport >= 1024*1024 {
@@ -563,8 +581,11 @@ func (a *app) downloadFile(source, destination, label string) error {
 	if err := file.Sync(); err != nil {
 		return err
 	}
-	if response.ContentLength <= 0 || received != response.ContentLength {
-		a.recordDownloadProgress(label, received, response.ContentLength, 100)
+	if total <= 0 || received != total {
+		a.recordDownloadProgress(label, received, total, 100)
+	}
+	if total > 0 && received != total {
+		return fmt.Errorf("download %s: connection ended early (%s of %s)", label, formatBytes(received), formatBytes(total))
 	}
 	if err := file.Close(); err != nil {
 		return err
@@ -572,6 +593,7 @@ func (a *app) downloadFile(source, destination, label string) error {
 	if err := os.Rename(tmp, destination); err != nil {
 		return err
 	}
+	complete = true
 	return nil
 }
 
@@ -609,73 +631,6 @@ func progressBar(percent int) string {
 	const width = 20
 	filled := percent * width / 100
 	return strings.Repeat("#", filled) + strings.Repeat("-", width-filled)
-}
-
-func (a *app) runOpenClaw(args ...string) error {
-	cmd, err := a.openclawCommand(args...)
-	if err != nil {
-		return err
-	}
-	return a.runCommand(cmd)
-}
-
-func (a *app) runCommand(cmd *exec.Cmd) error {
-	// The profile form and Install action authorize this automated setup. Never
-	// attach OpenClaw to the user's console; provide automatic confirmations to
-	// installer/provider prompts and stream output into the local dashboard.
-	cmd.Stdin = strings.NewReader(strings.Repeat("y\n", 32))
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		return err
-	}
-	stderr, err := cmd.StderrPipe()
-	if err != nil {
-		return err
-	}
-	var tailMu sync.Mutex
-	var tail []string
-	appendOutput := func(line string) {
-		tailMu.Lock()
-		tail = append(tail, line)
-		if len(tail) > 12 {
-			tail = append([]string(nil), tail[len(tail)-12:]...)
-		}
-		tailMu.Unlock()
-		a.recordCommandOutput(line)
-	}
-	if err := cmd.Start(); err != nil {
-		return err
-	}
-	var readers sync.WaitGroup
-	readers.Add(2)
-	go func() { defer readers.Done(); streamCommandOutput(stdout, appendOutput) }()
-	go func() { defer readers.Done(); streamCommandOutput(stderr, appendOutput) }()
-	waitErr := cmd.Wait()
-	readers.Wait()
-	if waitErr != nil {
-		tailMu.Lock()
-		lastOutput := strings.Join(tail, " | ")
-		tailMu.Unlock()
-		if lastOutput != "" {
-			return fmt.Errorf("%w: %s", waitErr, lastOutput)
-		}
-		return waitErr
-	}
-	return nil
-}
-
-func streamCommandOutput(reader io.Reader, writeLine func(string)) {
-	scanner := bufio.NewScanner(reader)
-	scanner.Split(scanConsoleLines)
-	scanner.Buffer(make([]byte, 4096), 1024*1024)
-	for scanner.Scan() {
-		if line := cleanCommandLine(scanner.Text()); line != "" {
-			writeLine(line)
-		}
-	}
-	if err := scanner.Err(); err != nil {
-		writeLine("Output stream warning: " + err.Error())
-	}
 }
 
 func scanConsoleLines(data []byte, atEOF bool) (advance int, token []byte, err error) {
@@ -838,129 +793,18 @@ func (a *app) handleStart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	a.mu.Lock()
-	ready := a.state.SetupComplete
+	ready, updating := a.state.SetupComplete, a.state.Updating
 	a.mu.Unlock()
 	if !ready {
 		http.Error(w, "finish local setup before starting the agent", http.StatusConflict)
 		return
 	}
+	if updating {
+		http.Error(w, "your assistant is still downloading an update; it will start by itself", http.StatusConflict)
+		return
+	}
 	a.wakeAssistant()
 	writeJSON(w, map[string]any{"ok": true})
-}
-
-func (a *app) startGateway() error {
-	a.syncChatContext()
-	// The model servers load alongside the gateway instead of before it: the gateway
-	// does not need the model until the first message, and "ready" below waits for both.
-	go func() {
-		if err := a.startLlama(); err != nil {
-			a.mu.Lock()
-			a.state.Error = "Could not start the local model: " + err.Error()
-			a.logLocked(a.state.Error)
-			_ = a.persistLocked()
-			a.mu.Unlock()
-		}
-	}()
-	if err := a.spawnGateway(); err != nil {
-		return err
-	}
-	go a.warmGateway()
-	return nil
-}
-
-// startGatewayAndWait is the supervisor's start: begin the Gateway and return once it
-// answers, or say why it did not.
-func (a *app) startGatewayAndWait() error {
-	a.syncChatContext()
-	if err := a.spawnGateway(); err != nil {
-		return err
-	}
-	for deadline := time.Now().Add(4 * time.Minute); time.Now().Before(deadline); time.Sleep(500 * time.Millisecond) {
-		if a.ctx.Err() != nil {
-			return a.ctx.Err()
-		}
-		a.mu.Lock()
-		gone := a.gateway == nil
-		a.mu.Unlock()
-		if gone {
-			return fmt.Errorf("the gateway exited while starting: %s", tailFile(filepath.Join(a.dataDir, "gateway.log"), 500))
-		}
-		if a.gatewayAlive() {
-			return nil
-		}
-	}
-	return fmt.Errorf("the gateway did not become ready in time")
-}
-
-// spawnGateway launches the OpenClaw Gateway process if it is not already running.
-func (a *app) spawnGateway() error {
-	a.mu.Lock()
-	if a.gateway != nil && a.gateway.Process != nil {
-		a.state.GatewayRunning = true
-		a.mu.Unlock()
-		return nil
-	}
-	if a.gatewayLog == nil {
-		f, err := os.OpenFile(filepath.Join(a.dataDir, "gateway.log"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
-		if err != nil {
-			a.mu.Unlock()
-			return err
-		}
-		a.gatewayLog = f
-	}
-	logFile := a.gatewayLog
-	a.mu.Unlock()
-	cmd, err := a.openclawCommand("gateway", "run")
-	if err != nil {
-		return fmt.Errorf("start Gateway: %w", err)
-	}
-	cmd.Stdout = logFile
-	cmd.Stderr = logFile
-	a.gwWarm.Store(false)
-	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("start Gateway: %w", err)
-	}
-	a.mu.Lock()
-	a.gateway = cmd
-	a.state.GatewayRunning = true
-	a.state.Step = "OpenClaw Gateway is starting"
-	a.logLocked("Started OpenClaw Gateway")
-	_ = a.persistLocked()
-	a.mu.Unlock()
-	go func() {
-		err := cmd.Wait()
-		a.mu.Lock()
-		if a.gateway == cmd {
-			a.gateway = nil
-			a.state.GatewayRunning = false
-			if a.gatewayStopped == cmd {
-				a.gatewayStopped = nil
-				a.logLocked("OpenClaw Gateway stopped")
-			} else if err != nil && a.ctx.Err() == nil {
-				a.state.Error = "Gateway exited: " + err.Error()
-				a.logLocked(a.state.Error)
-			} else {
-				a.logLocked("OpenClaw Gateway stopped")
-			}
-			_ = a.persistLocked()
-		}
-		a.mu.Unlock()
-	}()
-	return nil
-}
-
-func (a *app) stopGateway() {
-	a.mu.Lock()
-	cmd := a.gateway
-	a.gatewayStopped = cmd
-	a.mu.Unlock()
-	if cmd != nil && cmd.Process != nil {
-		if runtime.GOOS == "windows" {
-			_ = exec.Command("taskkill.exe", "/PID", fmt.Sprint(cmd.Process.Pid), "/T", "/F").Run()
-		} else {
-			_ = cmd.Process.Kill()
-		}
-	}
 }
 
 func (a *app) handleStop(w http.ResponseWriter, r *http.Request) {
@@ -969,15 +813,6 @@ func (a *app) handleStop(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	a.sleepAssistant()
-	writeJSON(w, map[string]any{"ok": true})
-}
-
-func (a *app) handleOpenClaw(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-	go func() { _ = a.runOpenClaw("dashboard") }()
 	writeJSON(w, map[string]any{"ok": true})
 }
 
@@ -995,136 +830,6 @@ func (a *app) handleWorkspace(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, map[string]any{"ok": true})
-}
-
-func (a *app) handleMemory(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-	r.Body = http.MaxBytesReader(w, r.Body, 4096)
-	var request struct {
-		Backend string `json:"backend"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
-		http.Error(w, "invalid memory provider", http.StatusBadRequest)
-		return
-	}
-	if request.Backend != "memory-core" && request.Backend != "honcho" && request.Backend != "memory-lancedb" && request.Backend != "mem0" {
-		http.Error(w, "unknown memory provider", http.StatusBadRequest)
-		return
-	}
-	a.mu.Lock()
-	if !a.state.SetupComplete || a.state.SetupRunning || a.state.MemoryRunning {
-		a.mu.Unlock()
-		http.Error(w, "finish setup and wait for the current operation", http.StatusConflict)
-		return
-	}
-	a.state.MemoryRunning = true
-	a.state.Error = ""
-	a.state.Step = "Preparing " + request.Backend
-	a.logLocked("Starting memory provider setup: " + request.Backend)
-	_ = a.persistLocked()
-	a.mu.Unlock()
-	go a.configureMemory(request.Backend)
-	writeJSON(w, map[string]any{"ok": true})
-}
-
-func (a *app) configureMemory(backend string) {
-	a.mu.Lock()
-	wasRunning := a.state.GatewayRunning
-	a.mu.Unlock()
-	if wasRunning {
-		a.setStep("Pausing the Gateway to update memory settings")
-		a.sleepAssistant()
-		deadline := time.Now().Add(12 * time.Second)
-		for time.Now().Before(deadline) {
-			a.mu.Lock()
-			stopped := a.gateway == nil
-			a.mu.Unlock()
-			if stopped {
-				break
-			}
-			time.Sleep(100 * time.Millisecond)
-		}
-		a.mu.Lock()
-		stillRunning := a.gateway != nil
-		a.mu.Unlock()
-		if stillRunning {
-			a.finishMemory("", errors.New("the Gateway did not stop; close its process before changing memory providers"), false)
-			return
-		}
-	}
-
-	var steps []struct {
-		label string
-		args  []string
-	}
-	add := func(label string, args ...string) {
-		steps = append(steps, struct {
-			label string
-			args  []string
-		}{label: label, args: args})
-	}
-	switch backend {
-	case "memory-core":
-		add("Selecting OpenClaw memory-core", "config", "set", "plugins.slots.memory", "memory-core")
-		add("Keeping the local embedding server in use", "config", "set", "memory.search.provider", "openai")
-		add("Refreshing the local memory index", "memory", "index", "--force")
-	case "honcho":
-		add("Keeping OpenClaw memory-core active alongside Honcho", "config", "set", "plugins.slots.memory", "memory-core")
-		add("Installing the Honcho memory plug-in", "plugins", "install", "clawhub:@honcho-ai/openclaw-honcho", "--force")
-		add("Starting Honcho setup", "honcho", "setup")
-	case "memory-lancedb":
-		add("Installing the LanceDB memory plug-in", "plugins", "install", "clawhub:@openclaw/memory-lancedb", "--force", "--no-enable")
-		localConfig := fmt.Sprintf(`{"embedding":{"provider":"openai","baseUrl":"http://127.0.0.1:%d/v1","apiKey":"llama-cpp-local","model":%q,"dimensions":768},"autoRecall":true,"autoCapture":true}`, llamaEmbedPort, embedModelID)
-		add("Configuring LanceDB to use the local embedding server", "config", "set", "plugins.entries.memory-lancedb.config", localConfig, "--strict-json", "--merge")
-		add("Activating LanceDB memory", "plugins", "enable", "memory-lancedb")
-		add("Selecting LanceDB as the active memory store", "config", "set", "plugins.slots.memory", "memory-lancedb")
-	case "mem0":
-		add("Installing the Mem0 memory plug-in", "plugins", "install", "clawhub:@mem0/openclaw-mem0", "--force")
-		add("Starting the Mem0 local or hosted setup wizard", "mem0", "init", "--mode", "open-source")
-		add("Selecting Mem0 as the active memory store", "config", "set", "plugins.slots.memory", "openclaw-mem0")
-	}
-
-	var operationErr error
-	for _, step := range steps {
-		a.setStep(step.label)
-		if err := a.runOpenClaw(step.args...); err != nil {
-			operationErr = fmt.Errorf("%s failed: %w", step.label, err)
-			break
-		}
-	}
-	active := backend
-	if backend == "honcho" {
-		active = "memory-core + Honcho"
-	}
-	if backend == "mem0" {
-		active = "openclaw-mem0"
-	}
-	if wasRunning {
-		a.setStep("Restarting the OpenClaw Gateway")
-		a.wakeAssistant()
-	}
-	a.finishMemory(active, operationErr, wasRunning)
-}
-
-func (a *app) finishMemory(active string, operationErr error, restartAttempted bool) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	a.state.MemoryRunning = false
-	if operationErr != nil {
-		a.state.Error = "Memory setup stopped: " + operationErr.Error()
-		a.state.Step = "Memory setup needs attention"
-		a.logLocked(a.state.Error)
-	} else {
-		a.state.MemoryBackend = active
-		a.state.Error = ""
-		a.state.Step = "Memory provider ready: " + active
-		a.logLocked(a.state.Step)
-	}
-	_ = restartAttempted
-	_ = a.persistLocked()
 }
 
 func cleanField(s string, max int) string {
@@ -1169,7 +874,7 @@ func openBrowser(address string) {
 // vendored scripts, and the JSON API.
 func publicPath(p string) bool {
 	switch p {
-	case "/", "/style.css", "/dashboard.css", "/app.js", "/orb.js", "/neuron.js", "/hud.js", "/voice.js", "/vad.js", "/stt.js", "/stt-worker.js", "/listen.js", "/capture-worklet.js", "/favicon.ico":
+	case "/", "/style.css", "/dashboard.css", "/app.js", "/orb.js", "/neuron.js", "/hud.js", "/widget.html", "/widget.js", "/widget.css", "/voice.js", "/vad.js", "/stt.js", "/stt-worker.js", "/listen.js", "/capture-worklet.js", "/favicon.ico":
 		return true
 	}
 	return strings.HasPrefix(p, "/api/") || strings.HasPrefix(p, "/vendor/") || strings.HasPrefix(p, "/models/whistle/")

@@ -1,11 +1,9 @@
 package main
 
 import (
-	"bufio"
-	"bytes"
-	"crypto/rand"
-	"encoding/hex"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -15,51 +13,8 @@ import (
 	"time"
 )
 
-// gatewayPort is fixed so the dashboard can always reach the Gateway's
-// OpenAI-compatible endpoint, which runs a real OpenClaw agent turn: tools,
-// skills, memory and sessions all apply, exactly as in OpenClaw's own chat.
-const (
-	gatewayPort    = 28615
-	dashboardAgent = "openclaw/main"
-	dashboardKey   = "dashboard"
-)
-
-func (a *app) gatewayTokenPath() string { return filepath.Join(a.dataDir, "gateway.token") }
-
-// gatewayToken returns the Gateway shared secret, creating it on first use.
-// It lives only on disk and in OpenClaw's config; the browser never sees it.
-func (a *app) gatewayToken() (string, error) {
-	if data, err := os.ReadFile(a.gatewayTokenPath()); err == nil {
-		if token := strings.TrimSpace(string(data)); token != "" {
-			return token, nil
-		}
-	}
-	raw := make([]byte, 24)
-	if _, err := rand.Read(raw); err != nil {
-		return "", err
-	}
-	token := hex.EncodeToString(raw)
-	if err := os.WriteFile(a.gatewayTokenPath(), []byte(token+"\n"), 0600); err != nil {
-		return "", err
-	}
-	return token, nil
-}
-
-// gatewayConfigSteps are the OpenClaw settings that expose the chat endpoint.
-func (a *app) gatewayConfigSteps() ([][]string, error) {
-	token, err := a.gatewayToken()
-	if err != nil {
-		return nil, err
-	}
-	return [][]string{
-		{"config", "set", "gateway.mode", "local"},
-		{"config", "set", "gateway.auth.mode", "token"},
-		{"config", "set", "gateway.auth.token", token},
-		{"config", "set", "gateway.bind", "loopback"},
-		{"config", "set", "gateway.port", fmt.Sprint(gatewayPort)},
-		{"config", "set", "gateway.http.endpoints.chatCompletions.enabled", "true"},
-	}, nil
-}
+// dashboardKey names the dashboard's conversation. It is kept between visits.
+const dashboardKey = "dashboard"
 
 // spokenHint is appended to a message when the reply will be spoken aloud.
 // timeHint tells the model the local time so greetings can fit the moment.
@@ -80,13 +35,16 @@ const spokenHint = "\n\n[This will be spoken aloud. Answer in one to three short
 	"No lists, bullets, numbering, headings, bold or emoji. If there is a lot to say, give the main point and offer to say more.]"
 
 type chatEvent struct {
-	Delta string `json:"delta,omitempty"`
-	Done  bool   `json:"done,omitempty"`
-	Error string `json:"error,omitempty"`
+	Delta    string       `json:"delta,omitempty"`
+	Tool     string       `json:"tool,omitempty"`     // the assistant is using a tool
+	Detail   string       `json:"detail,omitempty"`   // ... on this
+	Approval *approvalAsk `json:"approval,omitempty"` // waiting for the user to allow or refuse something
+	Done     bool         `json:"done,omitempty"`
+	Error    string       `json:"error,omitempty"`
 }
 
-// handleVoiceChat sends one message to the OpenClaw agent and streams the reply
-// back as newline-delimited JSON ({"delta":"..."} ... {"done":true}).
+// handleVoiceChat runs one agent turn and streams it back as newline-delimited JSON
+// ({"delta":"..."} ... {"done":true}). Tool use and approval requests arrive as events too.
 func (a *app) handleVoiceChat(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -110,50 +68,24 @@ func (a *app) handleVoiceChat(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "your assistant is asleep; wake it up first", http.StatusConflict)
 		return
 	}
-	// The Gateway takes about a minute to start answering; wait for it rather than fail.
-	for deadline := time.Now().Add(3 * time.Minute); !a.gatewayReady(); {
+	if !a.beginAgentWork() {
+		http.Error(w, "your assistant is already handling a message", http.StatusConflict)
+		return
+	}
+	defer a.endAgentWork()
+	// The model server takes a moment to load after waking; wait for it rather than fail.
+	for deadline := time.Now().Add(3 * time.Minute); !a.llamaHealthy(llamaChatPort); {
 		if time.Now().After(deadline) || r.Context().Err() != nil {
 			http.Error(w, "your assistant is still waking up; please try again in a moment", http.StatusServiceUnavailable)
 			return
 		}
 		time.Sleep(time.Second)
 	}
-	token, err := a.gatewayToken()
-	if err != nil {
-		http.Error(w, "could not read the gateway credentials", http.StatusInternalServerError)
-		return
-	}
-	content := text
-	content += timeHint(time.Now())
+	hint := timeHint(time.Now())
 	if in.Spoken {
-		// Small models follow what is nearest the end of the prompt, so the
-		// spoken-style instruction rides on each message instead of only
-		// living in the persona files.
-		content += spokenHint
-	}
-	payload, _ := json.Marshal(map[string]any{
-		"model":    dashboardAgent,
-		"stream":   true,
-		"messages": []map[string]string{{"role": "user", "content": content}},
-	})
-	upstream, err := http.NewRequestWithContext(r.Context(), http.MethodPost, fmt.Sprintf("http://127.0.0.1:%d/v1/chat/completions", gatewayPort), bytes.NewReader(payload))
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	upstream.Header.Set("Content-Type", "application/json")
-	upstream.Header.Set("Authorization", "Bearer "+token)
-	upstream.Header.Set("x-openclaw-session-key", dashboardKey)
-	response, err := (&http.Client{}).Do(upstream)
-	if err != nil {
-		http.Error(w, "your assistant is not answering yet; give it a moment and try again", http.StatusBadGateway)
-		return
-	}
-	defer response.Body.Close()
-	if response.StatusCode != http.StatusOK {
-		detail, _ := io.ReadAll(io.LimitReader(response.Body, 600))
-		http.Error(w, fmt.Sprintf("the assistant returned %s: %s", response.Status, strings.TrimSpace(string(detail))), http.StatusBadGateway)
-		return
+		// Small models follow what is nearest the end of the prompt, so the spoken-style
+		// instruction rides on each message instead of only living in the persona files.
+		hint += spokenHint
 	}
 
 	w.Header().Set("Content-Type", "application/x-ndjson; charset=utf-8")
@@ -165,43 +97,35 @@ func (a *app) handleVoiceChat(w http.ResponseWriter, r *http.Request) {
 			flusher.Flush()
 		}
 	}
-	scanner := bufio.NewScanner(response.Body)
-	scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if !strings.HasPrefix(line, "data:") {
-			continue
+	err := a.runTurnObserved(r.Context(), turnOptions{Session: dashboardKey, Text: text, Hint: hint, Spoken: in.Spoken}, func(e agentEvent) {
+		if e.Approval != nil {
+			a.updateAgentWork("awaiting_approval", "Waiting for approval")
+		} else if e.Tool != "" {
+			a.updateAgentWork("working", "Using "+e.Tool)
 		}
-		data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
-		if data == "[DONE]" {
-			break
-		}
-		var chunk struct {
-			Choices []struct {
-				Delta struct {
-					Content string `json:"content"`
-				} `json:"delta"`
-			} `json:"choices"`
-			Error any `json:"error"`
-		}
-		if json.Unmarshal([]byte(data), &chunk) != nil {
-			continue
-		}
-		if chunk.Error != nil {
-			emit(chatEvent{Error: gatewayErrorText(chunk.Error)})
-			return
-		}
-		for _, choice := range chunk.Choices {
-			if choice.Delta.Content != "" {
-				emit(chatEvent{Delta: choice.Delta.Content})
-			}
-		}
+		emit(chatEvent{Delta: e.Delta, Tool: e.Tool, Detail: e.Detail, Approval: e.Approval})
+	}, func(session string, messages []chatMsg, turnStart int, turnErr error) {
+		go a.observeConversationTurn(a.ctx, session, messages, turnStart, turnErr)
+	})
+	a.agentWarm.Store(true)
+	switch {
+	case err == nil:
+		emit(chatEvent{Done: true})
+	case errors.Is(err, context.Canceled) || r.Context().Err() != nil:
+		// the page went away; nothing to report
+	default:
+		emit(chatEvent{Error: err.Error()})
 	}
-	if err := scanner.Err(); err != nil && r.Context().Err() == nil {
-		emit(chatEvent{Error: "the connection to your assistant was interrupted"})
+}
+
+// handleAgentReset forgets the dashboard conversation (POST /api/agent/reset).
+func (a *app) handleAgentReset(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	emit(chatEvent{Done: true})
+	a.resetSession(dashboardKey)
+	writeJSON(w, map[string]any{"ok": true})
 }
 
 // inferenceBusy reports whether the chat model is generating right now, from
@@ -229,64 +153,54 @@ func (a *app) inferenceBusy() bool {
 	})
 }
 
-// warmGateway sends one tiny turn once the Gateway is listening. OpenClaw
-// initialises its tools lazily on the first agent run, which can take minutes;
-// doing it now means the user's first message is not the one that pays for it.
-func (a *app) warmGateway() {
-	defer a.gwWarm.Store(true) // even on failure: never leave the dashboard waiting forever
-	for deadline := time.Now().Add(6 * time.Minute); !a.gatewayReady(); time.Sleep(2 * time.Second) {
-		if a.ctx.Err() != nil || time.Now().After(deadline) {
-			return
+// startAgent is the agent service's start. The loop itself needs no process; this makes sure its
+// folders exist, refreshes the persona files, and sends one short turn so the model server has
+// processed the instructions before the user's first message.
+func (a *app) startAgent() error {
+	for _, dir := range []string{a.workspace, filepath.Join(a.workspace, "memory"), filepath.Join(a.workspace, "skills")} {
+		if err := os.MkdirAll(dir, 0700); err != nil {
+			return err
 		}
 	}
-	token, err := a.gatewayToken()
-	if err != nil {
-		return
+	if p := a.profile(); p.UserName != "" {
+		if err := a.writePersona(p); err != nil {
+			return err
+		}
 	}
-	payload, _ := json.Marshal(map[string]any{
-		"model":    dashboardAgent,
-		"messages": []map[string]string{{"role": "user", "content": "Reply with the single word: ready"}},
-	})
-	request, err := http.NewRequestWithContext(a.ctx, http.MethodPost, fmt.Sprintf("http://127.0.0.1:%d/v1/chat/completions", gatewayPort), bytes.NewReader(payload))
-	if err != nil {
-		return
+	if err := a.waitLlama(2 * time.Minute); err != nil {
+		return err
 	}
-	request.Header.Set("Content-Type", "application/json")
-	request.Header.Set("Authorization", "Bearer "+token)
-	request.Header.Set("x-openclaw-session-key", "warmup")
-	client := http.Client{Timeout: 4 * time.Minute}
-	if response, err := client.Do(request); err == nil {
-		_, _ = io.Copy(io.Discard, response.Body)
-		response.Body.Close()
+	a.warmAgent()
+	return nil
+}
+
+func (a *app) waitLlama(limit time.Duration) error {
+	for deadline := time.Now().Add(limit); !a.llamaHealthy(llamaChatPort); time.Sleep(500 * time.Millisecond) {
+		if a.ctx.Err() != nil {
+			return a.ctx.Err()
+		}
+		if time.Now().After(deadline) {
+			return errors.New("the language model did not become ready")
+		}
+	}
+	return nil
+}
+
+// warmAgent runs a throwaway one-word turn so llama-server has the instructions in its cache.
+func (a *app) warmAgent() {
+	defer a.agentWarm.Store(true) // even on failure: never leave the dashboard waiting forever
+	ctx, cancel := context.WithTimeout(a.ctx, 2*time.Minute)
+	defer cancel()
+	messages := []chatMsg{{Role: "system", Content: a.systemPrompt(time.Now())}, {Role: "user", Content: "Reply with the single word: ready"}}
+	if _, _, err := a.callModel(ctx, &modelGatewayCall{
+		Session: "warmup", Step: -1, Messages: messages, Spoken: true, emit: func(agentEvent) {},
+	}); err == nil {
 		a.recordCommandOutput("Your assistant is warmed up and ready")
 	}
 }
 
-// gatewayReady reports whether OpenClaw says it is ready (its /readyz probe),
-// cached briefly. A bare open port is not enough: the Gateway binds its port
-// well before it finishes loading plugins and can answer.
-func (a *app) gatewayReady() bool {
-	return a.gwReady.get(time.Second, func() bool {
-		if !a.llamaHealthy(llamaChatPort) {
-			return false
-		}
-		return a.gatewayAlive()
-	})
-}
-
-// gatewayAlive reports whether the OpenClaw Gateway itself answers its readiness probe.
-func (a *app) gatewayAlive() bool {
-	client := http.Client{Timeout: 1500 * time.Millisecond}
-	response, err := client.Get(fmt.Sprintf("http://127.0.0.1:%d/readyz", gatewayPort))
-	if err != nil {
-		return false
-	}
-	response.Body.Close()
-	return response.StatusCode == http.StatusOK
-}
-
-// gatewayErrorText turns an OpenAI-style error object into something a person can read.
-func gatewayErrorText(raw any) string {
+// modelErrorText turns an OpenAI-style error object into something a person can read.
+func modelErrorText(raw any) string {
 	if object, ok := raw.(map[string]any); ok {
 		if message, ok := object["message"].(string); ok && message != "" {
 			if strings.Contains(strings.ToLower(message), "context") {

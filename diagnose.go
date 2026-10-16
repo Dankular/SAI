@@ -32,19 +32,15 @@ func (a *app) diagnose() []diagCheck {
 	}
 
 	// ---- installed pieces
-	fileCheck("Node.js runtime", a.nodeExe())
-	if entry, err := a.openclawEntry(); err != nil {
-		add("OpenClaw", false, err.Error())
-	} else {
-		add("OpenClaw", true, entry)
-	}
 	if exe, ok := findFile(a.llamaRoot(), "llama-server.exe"); ok {
 		add("llama.cpp runtime", true, filepath.Base(filepath.Dir(exe)))
 	} else {
 		add("llama.cpp runtime", false, "no backend installed under "+a.llamaRoot())
 	}
-	fileCheck("Chat model (Agents-A1 4B)", a.chatModel())
+	fileCheck("Chat model (MiniCPM-V 4.7 1B)", a.chatModel())
+	fileCheck("Speculative-decoding draft (DSpark)", a.draftModel())
 	fileCheck("Embedding model", a.embedModel())
+	add("Workspace POSIX userland", a.workspaceUserlandReady(), a.userlandDir())
 	if exe, ok := findFile(a.audioRoot(), "audiocpp_server.exe"); ok {
 		add("Speech runtime", true, filepath.Base(filepath.Dir(exe)))
 	} else {
@@ -66,11 +62,7 @@ func (a *app) diagnose() []diagCheck {
 	}
 	rules, _ := os.ReadFile(filepath.Join(a.workspace, "AGENTS.md"))
 	add("Global rules in AGENTS.md", strings.Contains(string(rules), rulesBegin), "")
-	add("OpenClaw's own conventions kept in AGENTS.md", len(rules) > 2500, fmt.Sprintf("%d bytes", len(rules)))
-	registered := a.registeredChatContext()
-	add("OpenClaw context window matches the server", registered == chatContext, fmt.Sprintf("OpenClaw %d, server %d", registered, chatContext))
-	_, tokenErr := os.Stat(a.gatewayTokenPath())
-	add("Gateway credentials", tokenErr == nil, "")
+	add("Skills folder", isDir(filepath.Join(a.workspace, "skills")), fmt.Sprintf("%d skills", len(a.listSkills())))
 
 	// ---- running parts
 	add("Chat model server", a.llamaHealthy(llamaChatPort), fmt.Sprintf("port %d, backend %s", llamaChatPort, orDash(a.llamaBackendName())))
@@ -82,7 +74,7 @@ func (a *app) diagnose() []diagCheck {
 		add("Voice and turn models loaded", loaded[omniModelID] && loaded[turnModelID], fmt.Sprintf("omnivoice=%v smart-turn=%v", loaded[omniModelID], loaded[turnModelID]))
 	}
 	agent := a.sup.Agent()
-	add("OpenClaw Gateway", agent.Awake && a.gatewayReady(), fmt.Sprintf("port %d, assistant %s", gatewayPort, agent.State))
+	add("Agent loop", agent.Awake, "assistant "+agent.State)
 	for _, service := range a.sup.Status() {
 		if service.Wanted {
 			add("Process manager: "+service.Label, service.State == svcRunning, fmt.Sprintf("%s, %d restarts%s", service.State, service.Restarts, orDash2(service.Error)))
@@ -139,4 +131,9 @@ func orDash2(s string) string {
 		return ""
 	}
 	return ", " + s
+}
+
+func isDir(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && info.IsDir()
 }

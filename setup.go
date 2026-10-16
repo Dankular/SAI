@@ -21,50 +21,30 @@ type setupStage struct {
 	run       func(a *app) error
 }
 
-// Stages 1-7 install and download; they are resumable, so a retry skips what already
-// succeeded. Stages 8 onward start things and depend on live state, so they run on
+// Stages 1-8 install and download; they are resumable, so a retry skips what already
+// succeeded. Stages 9 onward start things and depend on live state, so they run on
 // every pass (and are quick).
 func setupStages() []setupStage {
 	return []setupStage{
 		{
-			label: "Get the assistant engine ready", step: "Installing a private Node.js runtime and OpenClaw",
-			failure: "OpenClaw install failed", resumable: true,
+			label: "Set up your workspace", step: "Preparing the assistant's workspace",
+			failure: "preparing the workspace failed", resumable: true,
 			run: func(a *app) error {
 				if err := os.MkdirAll(a.runtimeDir(), 0700); err != nil {
 					return err
 				}
-				if err := a.ensureNode(); err != nil {
-					return fmt.Errorf("private Node.js runtime install failed: %w", err)
-				}
-				return a.ensureOpenClaw()
-			},
-		},
-		{
-			label: "Set up your workspace", step: "Preparing the OpenClaw workspace",
-			failure: "preparing the workspace failed", resumable: true,
-			run: func(a *app) error {
-				if err := a.runOpenClaw("config", "set", "agents.defaults.workspace", a.workspace); err != nil {
-					return fmt.Errorf("setting the OpenClaw workspace failed: %w", err)
-				}
-				// Let OpenClaw lay down its own workspace files (its conventions in AGENTS.md and so on).
-				// Our persona is layered on top of them in a later stage.
-				if err := a.runOpenClaw("setup", "--baseline"); err != nil {
-					a.recordCommandOutput("OpenClaw could not create its baseline workspace files: " + err.Error())
-				}
-				// OpenClaw ships several model providers that are on by default. This assistant
-				// runs its own local model, so the Ollama provider only adds start-up work.
-				if err := a.runOpenClaw("plugins", "disable", "ollama"); err != nil {
-					a.recordCommandOutput("Could not turn off the unused Ollama provider: " + err.Error())
+				for _, dir := range []string{"memory", "skills"} {
+					if err := os.MkdirAll(filepath.Join(a.workspace, dir), 0700); err != nil {
+						return err
+					}
 				}
 				return nil
 			},
 		},
 		{
-			label: "Add the assistant's tools", step: "Installing the OpenClaw llama.cpp provider",
-			failure: "installing the local model provider failed", resumable: true,
-			run: func(a *app) error {
-				return a.runOpenClaw("plugins", "install", "clawhub:@openclaw/llama-cpp-provider", "--force")
-			},
+			label: "Prepare the workspace build userland", step: "Installing the private POSIX shell and build tools",
+			failure: "workspace build userland setup failed", resumable: true,
+			run: func(a *app) error { return a.ensureWorkspaceUserland() },
 		},
 		{
 			label: "Prepare for your graphics card", step: "Downloading the llama.cpp runtime for this GPU",
@@ -82,9 +62,18 @@ func setupStages() []setupStage {
 			},
 		},
 		{
-			label: "Download the assistant's brain", step: "Downloading Agents-A1 4B from Hugging Face",
-			failure: "downloading Agents-A1 4B failed", resumable: true,
-			run: func(a *app) error { return a.ensureModel(chatRepo, chatFile, a.chatModel()) },
+			label: "Download the assistant's brain", step: "Downloading MiniCPM-V 4.7 1B from Hugging Face",
+			failure: "downloading MiniCPM-V 4.7 1B failed", resumable: true,
+			run: func(a *app) error {
+				if err := a.ensureModel(chatRepo, chatFile, a.chatModel()); err != nil {
+					return err
+				}
+				// The draft only speeds replies up, so a failed download is not a failed install.
+				if err := a.ensureModel(draftRepo, draftFile, a.draftModel()); err != nil {
+					a.recordCommandOutput("Could not download the speed-up model (continuing without it): " + err.Error())
+				}
+				return nil
+			},
 		},
 		{
 			label: "Download its memory helper", step: "Downloading the local memory embedding model",
@@ -97,13 +86,10 @@ func setupStages() []setupStage {
 			run: func(a *app) error { return a.ensureVoiceAssets() },
 		},
 		{
-			label: "Start the assistant's brain and voice", step: "Starting the local model servers and connecting OpenClaw",
+			label: "Start the assistant's brain and voice", step: "Starting the local model servers",
 			failure: "starting the local models failed",
 			run: func(a *app) error {
 				if err := a.startLlama(); err != nil {
-					return err
-				}
-				if err := a.registerLocalModels(); err != nil {
 					return err
 				}
 				if err := a.startAudio(); err != nil {
@@ -113,28 +99,28 @@ func setupStages() []setupStage {
 			},
 		},
 		{
-			label: "Teach it your preferences", step: "Indexing the local profile and memory files",
-			failure: "memory indexing failed",
-			run:     func(a *app) error { return a.runOpenClaw("memory", "index", "--force") },
-		},
-		{
 			label: "Save your assistant's personality", step: "Saving the assistant persona",
 			failure: "saving persona files failed",
 			run:     func(a *app) error { return a.writePersona(a.profile()) },
 		},
 		{
-			label: "Wake up your assistant", step: "Starting the OpenClaw Gateway",
+			label: "Build the assistant's search brain", step: "Indexing workspace text, conversations, and memory",
+			failure: "memory indexing failed",
 			run: func(a *app) error {
-				if err := a.startGateway(); err != nil {
-					return err
-				}
-				// Make sure the Gateway survives startup rather than exiting on a config error.
-				for deadline := time.Now().Add(10 * time.Second); time.Now().Before(deadline); time.Sleep(500 * time.Millisecond) {
-					a.mu.Lock()
-					alive := a.gateway != nil
-					a.mu.Unlock()
-					if !alive {
-						return fmt.Errorf("the OpenClaw Gateway exited during startup: %s", tailFile(filepath.Join(a.dataDir, "gateway.log"), 800))
+				_, err := a.searchMemory(a.ctx, a.profile().UserName, 1)
+				return err
+			},
+		},
+		{
+			label: "Wake up your assistant", step: "Starting the assistant",
+			run: func(a *app) error {
+				a.wakeAssistant()
+				for deadline := time.Now().Add(3 * time.Minute); !a.sup.Agent().Awake; time.Sleep(500 * time.Millisecond) {
+					if a.ctx.Err() != nil {
+						return a.ctx.Err()
+					}
+					if st := a.sup.Agent(); st.State == "failed" || time.Now().After(deadline) {
+						return fmt.Errorf("the assistant did not wake up: %s", st.Detail)
 					}
 				}
 				return nil
@@ -171,7 +157,7 @@ func (a *app) bootstrap() {
 		a.mu.Unlock()
 	}()
 	if runtime.GOOS != "windows" {
-		a.fail(errors.New("the automatic OpenClaw installer currently supports Windows"))
+		a.fail(errors.New("the automatic installer currently supports Windows"))
 		return
 	}
 	if err := os.MkdirAll(a.workspace, 0700); err != nil {

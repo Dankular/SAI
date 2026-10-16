@@ -55,6 +55,35 @@ function renderSetupStages(snapshot) {
   }
 }
 
+// The download chip in the top bar: an existing install fetching what a new release adds. It never
+// takes space from the page; hover for a tooltip, click for the details.
+function renderNotify(snapshot) {
+  const notify = $("#notify");
+  const stopped = !snapshot.updating && snapshot.step === "Update stopped" && snapshot.error;
+  notify.classList.toggle("hidden", !snapshot.updating && !stopped);
+  if (!snapshot.updating && !stopped) { setNotifyOpen(false); return; }
+  const percent = Math.max(0, Math.min(100, Number(snapshot.progressStagePercent) || 0));
+  const step = snapshot.step || "Updating your assistant";
+  const detail = stopped ? snapshot.error : snapshot.progressDetail || "";
+  $("#update-step").textContent = step;
+  $("#update-detail").textContent = detail;
+  $("#update-fill").style.width = `${Math.max(2, percent)}%`;
+  $("#notify-pct").textContent = stopped ? "!" : `${percent}%`;
+  $("#notify-button").classList.toggle("attention", Boolean(stopped));
+  $("#notify-button").title = detail ? `${step}\n${detail}` : step;
+}
+
+function setNotifyOpen(open) {
+  $("#notify-panel").classList.toggle("hidden", !open);
+  $("#notify-button").setAttribute("aria-expanded", String(open));
+}
+$("#notify-button").addEventListener("click", (event) => {
+  event.stopPropagation();
+  setNotifyOpen($("#notify-panel").classList.contains("hidden"));
+});
+document.addEventListener("click", (event) => { if (!event.target.closest("#notify")) setNotifyOpen(false); });
+document.addEventListener("keydown", (event) => { if (event.key === "Escape") setNotifyOpen(false); });
+
 function render(snapshot) {
   if (!snapshot.setupComplete) {
     reveal("onboarding");
@@ -70,7 +99,8 @@ function render(snapshot) {
     progress.classList.toggle("hidden", !snapshot.profile.userName || (!snapshot.setupRunning && !snapshot.error && percent === 0));
     progress.classList.toggle("failed", Boolean(snapshot.error));
     progress.setAttribute("aria-busy", String(Boolean(snapshot.setupRunning)));
-    $("#progress-step").textContent = snapshot.error ? "Setup stopped" : snapshot.step || "Preparing setup";
+    const failedStage = (snapshot.stageLabels || [])[Math.max(0, (snapshot.progressStep || 1) - 1)];
+    $("#progress-step").textContent = snapshot.error ? (failedStage ? `Stopped at step ${snapshot.progressStep}: ${failedStage}` : "Setup stopped") : snapshot.step || "Preparing setup";
     $("#progress-count").textContent = snapshot.progressTotal ? `Step ${snapshot.progressStep || 0} of ${snapshot.progressTotal}` : "";
     $("#progress-fill").style.width = `${percent}%`;
     renderSetupStages(snapshot);
@@ -83,6 +113,8 @@ function render(snapshot) {
 
   reveal("dashboard");
   ensureHud();
+  renderNotify(snapshot);
+  renderWidget(snapshot);
   $("#welcome-name").textContent = snapshot.profile.userName || "there";
   // The process manager (snapshot.agent) is the only source of truth for what the assistant is
   // doing; nothing in this page decides it, so every tab agrees.
@@ -94,11 +126,14 @@ function render(snapshot) {
   ui.awake = agent.awake;
   if (ui.awake && ui.wakeRequested) { ui.wakeRequested = false; greet(); }
   ui.inferenceBusy = Boolean(snapshot.runtime && snapshot.runtime.inferenceBusy);
+  ui.serverOrbState = snapshot.orb?.state || (ui.waking ? "working" : ui.awake ? "active" : "idle");
+  ui.serverBusy = Boolean(snapshot.work?.busy);
+  ui.workState = snapshot.work?.state || "idle";
   ensureOrb();
   applyOrb();
   orb?.setWaking(ui.waking);
   updateSayBar();
-  $("#start-button").disabled = agent.wanted && agent.state !== "failed";
+  $("#start-button").disabled = Boolean(snapshot.updating) || (agent.wanted && agent.state !== "failed");
   $("#stop-button").disabled = !agent.wanted;
   $("#overall-status").classList.toggle("online", ui.awake);
   $("#overall-status").title = agent.detail || "";
@@ -124,8 +159,24 @@ function render(snapshot) {
 }
 
 async function refresh() {
-  try { render(await api("/api/state")); } catch (error) { console.error(error); }
+  try { applyStateSnapshot(await api("/api/state")); } catch (error) { console.error(error); }
 }
+
+let latestStateRevision = 0;
+function applyStateSnapshot(snapshot) {
+  const revision = Number(snapshot?.revision) || 0;
+  if (revision && revision < latestStateRevision) return;
+  latestStateRevision = Math.max(latestStateRevision, revision);
+  render(snapshot);
+}
+
+const stateEvents = new EventSource("/api/events");
+stateEvents.addEventListener("state", (event) => {
+  try {
+    const message = JSON.parse(event.data);
+    applyStateSnapshot(message.snapshot || message);
+  } catch (error) { console.error("Could not read the latest assistant state", error); }
+});
 
 $("#profile-form").addEventListener("submit", async (event) => {
   event.preventDefault();
@@ -169,13 +220,12 @@ $("#stop-button").addEventListener("click", async () => {
   } catch (e) { showError($("#error-box"), e.message); }
   finally { ui.sleeping = false; }
 });
-$("#chat-button").addEventListener("click", async () => { try { await api("/api/openclaw", { method: "POST", body: "{}" }); } catch (e) { showError($("#error-box"), e.message); } });
 $("#workspace-link").addEventListener("click", async (event) => { event.preventDefault(); try { await api("/api/workspace", { method: "POST", body: "{}" }); } catch (e) { showError($("#error-box"), e.message); } });
 // ---- Sphere + conversation -------------------------------------------------
 // The sphere shows what the assistant is doing: idle (asleep), active (awake),
 // listening, working (the model is running inference) and speaking. It moves to
 // the assistant's own voice only; the microphone never drives it.
-const ui = { micOn: false, turnSpeaking: false, warm: true, waking: false, wakeRequested: false, sleeping: false, profile: {}, awake: false, chatBusy: false, speaking: false, listening: false, inferenceBusy: false, textPulse: 0 };
+const ui = { micOn: false, turnSpeaking: false, warm: true, waking: false, wakeRequested: false, sleeping: false, profile: {}, awake: false, chatBusy: false, speaking: false, listening: false, inferenceBusy: false, serverBusy: false, workState: "idle", serverOrbState: "idle", textPulse: 0 };
 let orb = null;
 let orbLoading = false;
 let speech = null;
@@ -190,12 +240,7 @@ const ORB_COPY = {
 };
 
 function orbState() {
-  if (ui.waking) return "working";
-  if (!ui.awake) return "idle";
-  if (ui.turnSpeaking) return "speaking";
-  if (ui.chatBusy || ui.inferenceBusy) return "working";
-  if (ui.listening) return "listening";
-  return "active";
+  return ui.serverOrbState;
 }
 
 const PREVIEW = new URLSearchParams(location.search);
@@ -204,6 +249,57 @@ const MIN_DWELL_MS = 600;
 let shownState = null;
 let shownAt = 0;
 let dwellTimer = 0;
+
+let latestMicOrbLevel = 0;
+let latestOrbAudio = { level: 0, bass: 0, mid: 0, treble: 0 };
+let lastOrbAudioReport = 0;
+let lastOrbAudioSent = null;
+let orbAudioTimer = 0;
+function reportOrbAudioLevel(level, bands = {}) {
+  latestOrbAudio = {
+    level: Math.max(0, Math.min(1, Number(level) || 0)),
+    bass: Math.max(0, Math.min(1, Number(bands?.bass) || 0)),
+    mid: Math.max(0, Math.min(1, Number(bands?.mid) || 0)),
+    treble: Math.max(0, Math.min(1, Number(bands?.treble) || 0)),
+  };
+  const send = () => {
+    orbAudioTimer = 0;
+    const now = performance.now();
+    const same = lastOrbAudioSent && Object.keys(latestOrbAudio).every((key) => Math.abs(latestOrbAudio[key] - lastOrbAudioSent[key]) < 0.003);
+    if (same && now - lastOrbAudioReport < 200) return;
+    lastOrbAudioSent = { ...latestOrbAudio };
+    lastOrbAudioReport = now;
+    fetch("/api/orb", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(latestOrbAudio),
+      keepalive: true,
+    }).catch(() => {});
+  };
+  const wait = 34 - (performance.now() - lastOrbAudioReport);
+  if (wait <= 0) send();
+  else if (!orbAudioTimer) orbAudioTimer = setTimeout(send, wait);
+}
+function reportMicOrbLevel(rms) {
+  // Match the dashboard's mic meter scale: ordinary speech RMS fills it at roughly the same rate.
+  latestMicOrbLevel = ui.micOn && ui.listening ? Math.max(0, Math.min(1, (Number(rms) || 0) * 7)) : 0;
+  if (!assistantOwnsOrbAudio()) reportOrbAudioLevel(latestMicOrbLevel);
+}
+function assistantOwnsOrbAudio() {
+  return ui.chatBusy || ui.turnSpeaking || ui.speaking || Boolean(speech?.busy);
+}
+function reportAssistantOrbAudio(level, bands = {}) {
+  if (assistantOwnsOrbAudio()) reportOrbAudioLevel(level, bands);
+}
+function reportOrbEvent(name) {
+  if (name !== "stimulus" && name !== "flash") return;
+  fetch("/api/orb", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ [name]: true }),
+    keepalive: true,
+  }).catch(() => {});
+}
 
 function applyOrb() {
   // Design preview: /?orbstate=speaking&orbdemo=1 forces a state and a synthetic voice.
@@ -223,6 +319,7 @@ function applyOrb() {
   const stage = $(".orb-stage");
   if (stage) stage.dataset.state = state;
   let [title, hint] = ui.waking ? ["Waking up", "Getting everything ready, one moment"] : ORB_COPY[state];
+  if (ui.workState === "awaiting_approval") hint = "Waiting for approval in the chat";
   if (ui.awake && !ui.warm && state === "active") hint = "Ready. Your first reply may take a little longer";
   const stateLabel = $("#orb-state");
   if (stateLabel.textContent !== title) {
@@ -277,7 +374,10 @@ async function ensureSpeech() {
   if (speech) return speech;
   const { AgentSpeech } = await import("/voice.js");
   speech = new AgentSpeech({
-    onLevel: (level, bands) => orb?.setLevel(level, bands),
+    onLevel: (level, bands) => {
+      orb?.setLevel(level, bands);
+      reportAssistantOrbAudio(level, bands);
+    },
     onSpeaking: (speaking) => {
       ui.speaking = speaking; // audible right now (the sphere's level follows this on its own)
       if (speaking) {
@@ -286,6 +386,7 @@ async function ensureSpeech() {
         applyOrb();
       } else {
         endSpeakingTurn();
+        if (!ui.chatBusy) reportMicOrbLevel(0);
       }
     },
     onUnavailable: (why) => {
@@ -340,7 +441,7 @@ function addMessage(role, text, pending = false) {
 
 function updateSayBar() {
   if (typeof reflectMic === "function") { if (!ui.awake && ui.micOn) stopMic(); reflectMic(); }
-  const enabled = ui.awake && !ui.chatBusy;
+  const enabled = ui.awake && !ui.chatBusy && !ui.serverBusy;
   $("#say-input").disabled = !enabled;
   $("#say-send").disabled = !enabled;
   $("#say-input").placeholder = ui.awake ? "Type to your assistant…" : "Wake your assistant first";
@@ -349,16 +450,20 @@ function updateSayBar() {
 // With no audio to follow, a quick text-driven pulse keeps the sphere responsive.
 function pulseFromText(delta) {
   ui.textPulse = Math.min(1, 0.35 + delta.length / 40);
-  orb?.setLevel(ui.textPulse, { bass: ui.textPulse * 0.6, mid: ui.textPulse, treble: ui.textPulse * 0.4 });
-  setTimeout(() => orb?.setLevel(0, { bass: 0, mid: 0, treble: 0 }), 140);
+  const bands = { bass: ui.textPulse * 0.6, mid: ui.textPulse, treble: ui.textPulse * 0.4 };
+  orb?.setLevel(ui.textPulse, bands);
+  reportAssistantOrbAudio(ui.textPulse, bands);
+  setTimeout(() => {
+    orb?.setLevel(0, { bass: 0, mid: 0, treble: 0 });
+    reportAssistantOrbAudio(0);
+  }, 140);
 }
 
 function greeting() {
   const hour = new Date().getHours();
   const part = hour < 5 ? "Hello" : hour < 12 ? "Good morning" : hour < 18 ? "Good afternoon" : "Good evening";
   const name = (ui.profile.userName || "").trim();
-  const me = (ui.profile.agentName || "Your assistant").trim();
-  return `${part}${name ? ", " + name : ""}. ${me} is online and ready.`;
+  return `${part}${name ? ", " + name : ""}. I am online and ready. How can I help?`;
 }
 
 async function speakLine(text) {
@@ -395,8 +500,54 @@ function interruptAgent() {
   applyOrb();
 }
 
+const TOOL_LABELS = {
+  shell: "Running a command", read_file: "Reading a file", write_file: "Writing a file", edit_file: "Editing a file",
+  list_dir: "Looking at a folder", web_search: "Searching the web", web_fetch: "Reading a web page",
+  memory_search: "Checking its memory", remember: "Making a note", read_skill: "Reading a skill",
+};
+
+// A line under the reply while the assistant uses a tool.
+function showToolNote(bubble, event) {
+  let note = bubble.nextElementSibling;
+  if (!note || !note.classList.contains("tool-note")) {
+    note = document.createElement("div");
+    note.className = "tool-note";
+    bubble.insertAdjacentElement("afterend", note);
+  }
+  const label = TOOL_LABELS[event.tool] || `Using ${event.tool}`;
+  note.textContent = event.detail ? `${label}: ${event.detail}` : label;
+  $("#convo").scrollTop = $("#convo").scrollHeight;
+}
+
+// Asks the person to allow or refuse something the assistant wants to do.
+function showApproval(bubble, ask) {
+  const card = document.createElement("div");
+  card.className = "approval";
+  const text = document.createElement("div");
+  text.className = "approval-text";
+  text.textContent = ask.summary;
+  const row = document.createElement("div");
+  row.className = "approval-actions";
+  const answer = async (allow) => {
+    card.remove();
+    try { await api("/api/agent/approve", { method: "POST", body: JSON.stringify({ id: ask.id, allow }) }); } catch { /* the request may have timed out already */ }
+  };
+  for (const [label, allow] of [["Allow", true], ["Don't allow", false]]) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = allow ? "button button-primary" : "button button-outline";
+    button.textContent = label;
+    button.addEventListener("click", () => answer(allow));
+    row.append(button);
+  }
+  card.append(text, row);
+  (bubble.nextElementSibling?.classList.contains("tool-note") ? bubble.nextElementSibling : bubble).insertAdjacentElement("afterend", card);
+  $("#convo").scrollTop = $("#convo").scrollHeight;
+}
+
 async function sendToAgent(text) {
   orb?.stimulus(); // the user's input reaches the neuron
+  reportOrbEvent("stimulus");
   ui.chatBusy = true;
   ui.turnSpeaking = false;
   speech?.stop();
@@ -437,8 +588,13 @@ async function sendToAgent(text) {
       if (!line.trim()) return;
       const event = JSON.parse(line);
       if (event.error) throw new Error(event.error);
+      if (event.tool) { showToolNote(bubble, event); return; }
+      if (event.approval) { showApproval(bubble, event.approval); return; }
       if (!event.delta) return;
-      if (!rawReply) orb?.flash(); // the reply has begun: pink flash through the neuron
+      if (!rawReply) {
+        orb?.flash(); // the reply has begun: pink flash through the neuron
+        reportOrbEvent("flash");
+      }
       rawReply += event.delta;
       bubble.innerHTML = renderMarkdown(rawReply);
       $("#convo").scrollTop = $("#convo").scrollHeight;
@@ -466,6 +622,7 @@ async function sendToAgent(text) {
     }
   } finally {
     bubble.classList.remove("pending");
+    document.querySelectorAll(".tool-note, .approval").forEach((el) => el.remove());
     ui.chatBusy = false;
     endSpeakingTurn();
     applyOrb();
@@ -496,10 +653,12 @@ function setListenStatus(text) {
 function setMicLevel(rms) {
   const fill = $("#mic-level-fill");
   if (fill) fill.style.width = `${Math.min(100, Math.round(rms * 700))}%`;
+  reportMicOrbLevel(rms);
 }
 
 function onListenStatus(status, detail) {
   ui.listening = status === "hearing" || status === "checking";
+  if (!ui.listening) reportMicOrbLevel(0);
   setListenStatus(detail?.thinking ? "Take your time…" : LISTEN_TEXT[status] || "");
   applyOrb();
 }
@@ -544,6 +703,7 @@ function reflectMic() {
 async function startMic() {
   if (ui.micOn || !ui.awake) return;
   ui.micOn = true;
+  reportMicOrbLevel(0);
   reflectMic();
   setListenStatus("Loading speech recognition…");
   try {
@@ -554,6 +714,7 @@ async function startMic() {
   } catch (error) {
     console.warn("microphone could not start", error);
     ui.micOn = false;
+    reportMicOrbLevel(0);
     reflectMic();
     const denied = error && (error.name === "NotAllowedError" || error.name === "SecurityError");
     addMessage("error", denied
@@ -566,6 +727,7 @@ function stopMic() {
   if (!ui.micOn) return;
   ui.micOn = false;
   ui.listening = false;
+  reportMicOrbLevel(0);
   hands?.stop();
   reflectMic();
   applyOrb();
@@ -577,13 +739,32 @@ $("#say-form").addEventListener("submit", async (event) => {
   event.preventDefault();
   const input = $("#say-input");
   const text = input.value.trim();
-  if (!text || ui.chatBusy || !ui.awake) return;
+  if (!text || ui.chatBusy || ui.serverBusy || !ui.awake) return;
   input.value = "";
   addMessage("user", text);
   await sendToAgent(text);
 });
 
 $("#voice-on").addEventListener("change", (event) => { if (!event.target.checked) speech?.stop(); });
+
+// ---- Desktop widget ---------------------------------------------------------
+async function setWidget(settings) {
+  try {
+    await api("/api/widget", { method: "POST", body: JSON.stringify(settings) });
+  } catch (error) { showError($("#error-box"), error.message); }
+  refresh();
+}
+$("#widget-on").addEventListener("change", (event) => setWidget({ enabled: event.target.checked }));
+$("#widget-corner").addEventListener("change", (event) => setWidget({ corner: event.target.value }));
+function renderWidget(snapshot) {
+  const toggle = $("#widget-on");
+  if (document.activeElement !== toggle) toggle.checked = Boolean(snapshot.widgetEnabled);
+  const corner = $("#widget-corner");
+  corner.classList.toggle("hidden", !snapshot.widgetEnabled);
+  if (document.activeElement !== corner) corner.value = snapshot.widgetCorner || "top-right";
+  const service = (snapshot.services || []).find((s) => s.name === "widget");
+  toggle.parentElement.title = service && service.error ? `The widget could not start: ${service.error}` : "Show the draggable orb on your desktop; empty space passes clicks through";
+}
 
 // ---- Terminal drawer in the sidebar ---------------------------------------
 function setTerminal(open) {
@@ -599,7 +780,6 @@ $("#terminal-toggle").addEventListener("click", () => setTerminal($("#terminal-p
 try { if (localStorage.getItem("sai-terminal") === "1") setTerminal(true); } catch { /* ignore */ }
 
 refresh();
-setInterval(refresh, 1500);
 
 
 // ---- HUD frames around the panels --------------------------------------------

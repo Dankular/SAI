@@ -80,7 +80,7 @@ func TestPersonaTemplatesNameTheRightPeople(t *testing.T) {
 		}
 	}
 	identity := identityFile("Ada", "Sam")
-	for _, want := range []string{`Never say "I am Sam"`, "You are Ada", "They are Sam", "Qwen3.5"} {
+	for _, want := range []string{"You are Ada", "The person talking to you is Sam", "never you", "MiniCPM-V"} {
 		if !strings.Contains(identity, want) {
 			t.Errorf("IDENTITY.md is missing %q", want)
 		}
@@ -114,8 +114,33 @@ func TestUpsertRulesKeepsOtherContentAndIsIdempotent(t *testing.T) {
 		t.Fatal(err)
 	}
 	data, _ = os.ReadFile(path)
-	if strings.Count(string(data), rulesBegin) != 1 || !strings.Contains(string(data), "you are Bea") {
+	if strings.Count(string(data), rulesBegin) != 1 || !strings.Contains(string(data), "You are Bea") {
 		t.Fatalf("rules block was not updated in place:\n%s", data)
+	}
+}
+
+// Earlier releases left OpenClaw's long AGENTS.md template under our block. It is removed (it
+// describes files and a startup process that no longer exist) and anything else the user wrote stays.
+func TestUpsertRulesDropsTheOldOpenClawTemplate(t *testing.T) {
+	a := newTestApp(t)
+	_ = os.MkdirAll(a.workspace, 0700)
+	path := filepath.Join(a.workspace, "AGENTS.md")
+	legacy := rulesBlock("Ada", "Sam") + `
+# AGENTS.md - Your Workspace
+
+## First Run
+If BOOTSTRAP.md exists, follow it.
+
+## Session Startup
+Use runtime-provided startup context first.
+`
+	_ = os.WriteFile(path, []byte(legacy), 0600)
+	if err := a.upsertRules("Ada", "Sam"); err != nil {
+		t.Fatal(err)
+	}
+	data, _ := os.ReadFile(path)
+	if strings.Contains(string(data), "BOOTSTRAP") || strings.Contains(string(data), "Session Startup") || strings.Count(string(data), rulesBegin) != 1 {
+		t.Errorf("legacy template survived or the block was lost:\n%s", data)
 	}
 }
 
@@ -183,6 +208,21 @@ func TestBackendAssets(t *testing.T) {
 	}
 }
 
+func TestPickLlamaReleaseSkipsReleasesWithoutWindowsBinaries(t *testing.T) {
+	releases := []ghRelease{
+		{Tag: "v0.7.0", Assets: []ghAsset{{Name: "source.tar.gz"}}},
+		*fakeRelease("llama-b2-bin-win-cpu-x64.zip"),
+		*fakeRelease("llama-b1-bin-win-cpu-x64.zip"),
+	}
+	releases[1].Tag, releases[2].Tag = "b2", "b1"
+	if got := pickLlamaRelease(releases); got == nil || got.Tag != "b2" {
+		t.Errorf("got %+v, want b2", got)
+	}
+	if pickLlamaRelease(releases[:1]) != nil {
+		t.Error("a release with no Windows build must not be picked")
+	}
+}
+
 func TestCudaBuildVersionPicksNewestSupported(t *testing.T) {
 	release := fakeRelease("llama-b1-bin-win-cuda-12.4-x64.zip", "llama-b1-bin-win-cuda-13.4-x64.zip")
 	for _, c := range []struct{ major, minor, wantMajor, wantMinor int }{
@@ -204,48 +244,6 @@ func TestForcedBackendOverridesDetection(t *testing.T) {
 	}
 	if got := a.audioBackendCandidates(); len(got) != 1 || got[0] != "vulkan" {
 		t.Errorf("audio backends = %v", got)
-	}
-}
-
-// ---- OpenClaw's registered context window ------------------------------------
-
-func TestRegisteredChatContext(t *testing.T) {
-	a := newTestApp(t)
-	path := a.openclawConfigPath()
-	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
-		t.Fatal(err)
-	}
-	if got := a.registeredChatContext(); got != 0 {
-		t.Errorf("no config file: got %d, want 0", got)
-	}
-	config := `{"models":{"providers":{"llama-cpp":{"models":[{"id":"agents-a1-4b","contextWindow":16384}]}}}}`
-	_ = os.WriteFile(path, []byte(config), 0600)
-	if got := a.registeredChatContext(); got != 16384 {
-		t.Errorf("got %d, want 16384", got)
-	}
-	_ = os.WriteFile(path, []byte(strings.Replace(config, "16384", "32768", 1)), 0600)
-	if got := a.registeredChatContext(); got != chatContext {
-		t.Errorf("got %d, want %d", got, chatContext)
-	}
-	// Tolerates a config that is not strict JSON (comments, trailing commas).
-	_ = os.WriteFile(path, []byte("// note\n{ \"contextWindow\": 24576, }"), 0600)
-	if got := a.registeredChatContext(); got != 24576 {
-		t.Errorf("fallback parse: got %d, want 24576", got)
-	}
-}
-
-func TestChatProviderJSONIsValid(t *testing.T) {
-	var provider struct {
-		Models []struct {
-			ID            string `json:"id"`
-			ContextWindow int    `json:"contextWindow"`
-		} `json:"models"`
-	}
-	if err := json.Unmarshal([]byte(chatProviderJSON()), &provider); err != nil {
-		t.Fatalf("invalid JSON: %v", err)
-	}
-	if len(provider.Models) != 1 || provider.Models[0].ID != chatModelID || provider.Models[0].ContextWindow != chatContext {
-		t.Errorf("unexpected provider: %+v", provider)
 	}
 }
 
@@ -307,13 +305,13 @@ func TestExtractZipRejectsPathEscapes(t *testing.T) {
 }
 
 func TestGatewayErrorTextIsReadable(t *testing.T) {
-	if got := gatewayErrorText(map[string]any{"message": "Context size has been exceeded"}); !strings.Contains(got, "too long") {
+	if got := modelErrorText(map[string]any{"message": "Context size has been exceeded"}); !strings.Contains(got, "too long") {
 		t.Errorf("context overflow should have a friendly message, got %q", got)
 	}
-	if got := gatewayErrorText(map[string]any{"message": "internal error"}); strings.Contains(got, "map[") {
+	if got := modelErrorText(map[string]any{"message": "internal error"}); strings.Contains(got, "map[") {
 		t.Errorf("error objects must not be printed raw: %q", got)
 	}
-	if got := gatewayErrorText(nil); got == "" {
+	if got := modelErrorText(nil); got == "" {
 		t.Error("expected a fallback message")
 	}
 }
@@ -343,7 +341,7 @@ func TestFirstPersonaInstallReplacesOpenClawTemplates(t *testing.T) {
 	if err := a.writePersona(profile); err != nil {
 		t.Fatal(err)
 	}
-	for name, want := range map[string]string{"IDENTITY.md": "Name: Ada", "SOUL.md": "Soul of Ada", "USER.md": "Name: Sam"} {
+	for name, want := range map[string]string{"IDENTITY.md": "You are Ada", "SOUL.md": "Soul of Ada", "USER.md": "Name: Sam"} {
 		data, _ := os.ReadFile(filepath.Join(a.workspace, name))
 		if strings.Contains(string(data), "TEMPLATE") || !strings.Contains(string(data), want) {
 			t.Errorf("%s: the first install must replace OpenClaw's template; got:\n%.200s", name, data)

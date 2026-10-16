@@ -22,22 +22,25 @@ import (
 )
 
 // Sovereign AI owns model serving: it runs two private llama-server processes
-// (chat and embeddings) from the runtime directory and registers them with
-// OpenClaw as a standard OpenAI-compatible llama.cpp server. OpenClaw remains
-// the agent: Gateway, dashboard, tools, plugins and memory search are all its.
+// (chat and embeddings) from the runtime directory. The agent loop in agent.go talks to the
+// chat server's OpenAI-compatible API; memory.go uses the embedding server.
 //
 //	runtime/llama/<backend>   llama.cpp release for one backend (cuda|sycl|vulkan|cpu)
 //	runtime/models            GGUF weights
 const (
 	llamaChatPort  = 19432
 	llamaEmbedPort = 19433
-	chatModelID    = "agents-a1-4b"
+	chatModelID    = "minicpm-v-4.7-1b"
 	embedModelID   = "embeddinggemma-2"
-	chatRepo       = "InternScience/Agents-A1-4B-Q4_K_M-GGUF"
-	chatFile       = "Agents-A1-4B-Q4_K_M.gguf"
-	embedRepo      = "ggml-org/embeddinggemma-2-GGUF"
-	embedFile      = "embeddinggemma-2-Q8_0.gguf"
-	chatContext    = 32768 // OpenClaw's own prompt is ~11k tokens; leave room for history
+	chatRepo       = "openbmb/MiniCPM-V-4.7-1B-gguf"
+	chatFile       = "MiniCPM-V-4_7-1B-Q8_0.gguf"
+	// DSpark draft: a small model trained to pair with the chat model. It proposes up to 15 tokens at a
+	// time and the chat model verifies them, so replies come out several times faster with identical text.
+	draftRepo   = "openbmb/MiniCPM-V-4.7-1B-DSpark-gguf"
+	draftFile   = "dspark-MiniCPM-V-4_7-1B-Q8_0.gguf"
+	embedRepo   = "ggml-org/embeddinggemma-2-GGUF"
+	embedFile   = "embeddinggemma-2-Q8_0.gguf"
+	chatContext = 32768 // the agent prompt is ~4k tokens; the rest is conversation and tool output
 )
 
 type llamaState struct {
@@ -64,6 +67,7 @@ type ghRelease struct {
 func (a *app) llamaRoot() string  { return filepath.Join(a.runtimeDir(), "llama") }
 func (a *app) modelsDir() string  { return filepath.Join(a.runtimeDir(), "models") }
 func (a *app) chatModel() string  { return filepath.Join(a.modelsDir(), chatFile) }
+func (a *app) draftModel() string { return filepath.Join(a.modelsDir(), draftFile) }
 func (a *app) embedModel() string { return filepath.Join(a.modelsDir(), embedFile) }
 
 func (a *app) llamaBackendName() string {
@@ -157,7 +161,7 @@ func (a *app) latestLlamaRelease() (*ghRelease, error) {
 	if cached != nil {
 		return cached, nil
 	}
-	response, err := a.httpGet("https://api.github.com/repos/ggml-org/llama.cpp/releases?per_page=1")
+	response, err := a.httpGet("https://api.github.com/repos/ggml-org/llama.cpp/releases?per_page=30")
 	if err != nil {
 		return nil, fmt.Errorf("look up llama.cpp releases: %w", err)
 	}
@@ -166,10 +170,32 @@ func (a *app) latestLlamaRelease() (*ghRelease, error) {
 	if err := json.NewDecoder(response.Body).Decode(&releases); err != nil || len(releases) == 0 {
 		return nil, errors.New("read llama.cpp release index failed")
 	}
+	release := pickLlamaRelease(releases)
+	if release == nil {
+		return nil, errors.New("none of the recent llama.cpp releases has a Windows build")
+	}
 	a.llama.mu.Lock()
-	a.llama.release = &releases[0]
+	a.llama.release = release
 	a.llama.mu.Unlock()
-	return &releases[0], nil
+	return release, nil
+}
+
+// pickLlamaRelease returns the newest release that actually ships Windows binaries. The
+// project also publishes releases with no binaries (a version-tagged one was newest on
+// 2026-10-15), so "the latest release" is not always one we can install.
+func pickLlamaRelease(releases []ghRelease) *ghRelease {
+	arch := "x64"
+	if runtime.GOARCH == "arm64" {
+		arch = "arm64"
+	}
+	for i := range releases {
+		for _, asset := range releases[i].Assets {
+			if strings.HasPrefix(asset.Name, "llama-") && strings.HasSuffix(asset.Name, "bin-win-cpu-"+arch+".zip") {
+				return &releases[i]
+			}
+		}
+	}
+	return nil
 }
 
 // backendAssets selects the release zips needed for a backend.
@@ -388,7 +414,11 @@ func (a *app) ensureModel(repo, file, dest string) error {
 	if err := os.MkdirAll(filepath.Dir(dest), 0700); err != nil {
 		return err
 	}
-	if err := a.requireFreeSpace(filepath.Dir(dest), size, file); err != nil {
+	remaining := size
+	if info, err := os.Stat(dest + ".download"); err == nil && info.Size() < size {
+		remaining = size - info.Size() // a partial download is continued, not restarted
+	}
+	if err := a.requireFreeSpace(filepath.Dir(dest), remaining, file); err != nil {
 		return err
 	}
 	if err := a.downloadFile("https://huggingface.co/"+repo+"/resolve/main/"+file, dest, file); err != nil {
@@ -486,12 +516,52 @@ func (a *app) launchLlama(backend, dir string) error {
 		model string
 		args  []string
 	}{
-		// One slot: OpenClaw prompts are ~11k tokens, so parallel slots sharing the window would overflow it
-		// whenever two requests overlap. 8-bit KV cache keeps the larger window within the same VRAM.
+		// One slot: parallel slots would split the context window between requests. The 8-bit KV cache
+		// keeps the larger window within the same VRAM.
 		{"chat", llamaChatPort, a.chatModel(), []string{"--alias", chatModelID, "-c", strconv.Itoa(chatContext), "--jinja", "-np", "1", "-fa", "on", "--cache-type-k", "q8_0", "--cache-type-v", "q8_0"}},
 		{"embeddings", llamaEmbedPort, a.embedModel(), []string{"--alias", embedModelID, "--embeddings", "-c", "2048", "-b", "2048", "-ub", "2048"}},
 	}
 	for _, server := range servers {
+		if server.name == "chat" && isFile(a.draftModel()) && os.Getenv("SOVEREIGNAI_NO_DRAFT") == "" {
+			draft := append(append([]string{}, server.args...), "-md", a.draftModel(), "--spec-type", "draft-dspark", "--spec-draft-n-max", "15", "-ngld", "99")
+			if err := a.launchLlamaServer(dir, server.name, server.port, server.model, draft); err == nil {
+				a.recordCommandOutput("Speculative decoding (DSpark) is on")
+				continue
+			} else {
+				// An older llama.cpp or a backend without support: run without the draft rather than not at all.
+				a.recordCommandOutput("DSpark draft unavailable, continuing without it: " + err.Error())
+				a.killLastLlama()
+			}
+		}
+		if err := a.launchLlamaServer(dir, server.name, server.port, server.model, server.args); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// killLastLlama stops the most recently started server (one that failed to come up).
+func (a *app) killLastLlama() {
+	if n := len(a.llama.cmds); n > 0 {
+		if p := a.llama.cmds[n-1].Process; p != nil {
+			_ = p.Kill()
+		}
+		a.llama.cmds = a.llama.cmds[:n-1]
+	}
+	if n := len(a.llama.logs); n > 0 {
+		_ = a.llama.logs[n-1].Close()
+		a.llama.logs = a.llama.logs[:n-1]
+	}
+}
+
+func (a *app) launchLlamaServer(dir, name string, port int, model string, extra []string) error {
+	server := struct {
+		name  string
+		port  int
+		model string
+		args  []string
+	}{name, port, model, extra}
+	{
 		logPath := filepath.Join(a.dataDir, "llama-"+server.name+".log")
 		logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0600)
 		if err != nil {
@@ -555,34 +625,6 @@ func (a *app) stopLlamaLocked() {
 	a.setLlamaBackend("")
 }
 
-// registerLocalModels points OpenClaw at the local servers: chat through its
-// llama.cpp provider's existing-server path, memory embeddings through the
-// OpenAI-compatible remote embedding settings.
-func (a *app) registerLocalModels() error {
-	embedURL := fmt.Sprintf("http://127.0.0.1:%d/v1", llamaEmbedPort)
-	steps := [][]string{
-		{"config", "set", "models.providers.llama-cpp", chatProviderJSON(), "--strict-json"},
-		{"config", "set", "gateway.mode", "local"},
-		{"models", "set", "llama-cpp/" + chatModelID},
-		{"config", "set", "memory.search.provider", "openai"},
-		{"config", "set", "memory.search.remote.baseUrl", embedURL},
-		{"config", "set", "memory.search.remote.apiKey", "llama-cpp-local"},
-		{"config", "set", "memory.search.model", embedModelID},
-		{"config", "set", "memory.search.fallback", "none"},
-	}
-	gateway, err := a.gatewayConfigSteps()
-	if err != nil {
-		return err
-	}
-	steps = append(steps, gateway...)
-	for _, args := range steps {
-		if err := a.runOpenClaw(args...); err != nil {
-			return fmt.Errorf("OpenClaw command %q failed: %w", strings.Join(args[:2], " "), err)
-		}
-	}
-	return nil
-}
-
 func contains(list []string, item string) bool {
 	for _, v := range list {
 		if v == item {
@@ -590,77 +632,4 @@ func contains(list []string, item string) bool {
 		}
 	}
 	return false
-}
-
-// chatProviderJSON declares the chat model to OpenClaw as an external
-// OpenAI-compatible server. (`onboard --non-interactive` is avoided: on Windows it
-// fails removing its own temporary SQLite file before applying anything.)
-func chatProviderJSON() string {
-	chatURL := fmt.Sprintf("http://127.0.0.1:%d/v1", llamaChatPort)
-	return fmt.Sprintf(`{"baseUrl":%q,"apiKey":"llama-cpp-local","api":"openai-completions","models":[{"id":%q,"name":"Agents-A1 4B Q4_K_M","reasoning":false,"input":["text"],"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0},"contextWindow":%d,"maxTokens":4096,"compat":{"supportsTools":true}}]}`, chatURL, chatModelID, chatContext)
-}
-
-func (a *app) openclawConfigPath() string {
-	return filepath.Join(a.runtimeDir(), "home", ".openclaw-a1", "openclaw.json")
-}
-
-var contextWindowRE = regexp.MustCompile(`"contextWindow"\s*:\s*(\d+)`)
-
-// registeredChatContext reads the context window OpenClaw has on file for the chat
-// model (0 if it cannot be determined).
-func (a *app) registeredChatContext() int {
-	data, err := os.ReadFile(a.openclawConfigPath())
-	if err != nil {
-		return 0
-	}
-	var cfg struct {
-		Models struct {
-			Providers map[string]struct {
-				Models []struct {
-					ID            string `json:"id"`
-					ContextWindow int    `json:"contextWindow"`
-				} `json:"models"`
-			} `json:"providers"`
-		} `json:"models"`
-	}
-	if json.Unmarshal(data, &cfg) == nil {
-		for _, model := range cfg.Models.Providers["llama-cpp"].Models {
-			if model.ID == chatModelID {
-				return model.ContextWindow
-			}
-		}
-	}
-	if m := contextWindowRE.FindSubmatch(data); m != nil {
-		n, _ := strconv.Atoi(string(m[1]))
-		return n
-	}
-	return 0
-}
-
-// syncChatContext makes OpenClaw's idea of the model's context window match the
-// window the server really runs. If they differ, OpenClaw mis-budgets the prompt and
-// compacts the conversation far too early, which makes replies slow. A one-off
-// `config set` can be silently lost (for example if it collides with a gateway that
-// is still shutting down), so this is checked on every start and retried.
-var ctxSyncMu sync.Mutex // the start-up check and a wake-up can both ask at once
-
-func (a *app) syncChatContext() {
-	ctxSyncMu.Lock()
-	defer ctxSyncMu.Unlock()
-	if a.registeredChatContext() == chatContext {
-		return
-	}
-	a.recordCommandOutput(fmt.Sprintf("Updating OpenClaw's context window to %d tokens", chatContext))
-	for attempt := 0; attempt < 4 && a.ctx.Err() == nil; attempt++ {
-		if err := a.runOpenClaw("config", "set", "models.providers.llama-cpp", chatProviderJSON(), "--strict-json"); err == nil && a.registeredChatContext() == chatContext {
-			a.recordCommandOutput("OpenClaw's context window is now in step with the model server")
-			return
-		}
-		select {
-		case <-a.ctx.Done():
-			return
-		case <-time.After(8 * time.Second):
-		}
-	}
-	a.recordCommandOutput("Could not update OpenClaw's context window; replies may be slower than they should be")
 }

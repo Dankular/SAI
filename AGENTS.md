@@ -2,25 +2,33 @@
 
 ## Project Structure & Module Organization
 
-A Go program (standard library only) that provisions and supervises a local assistant. Source files are in
-the repository root, one concern per file:
+A Go program that provisions and supervises a local assistant. It uses chromem-go as its embedded,
+persistent vector store. Source files are in the repository root, one concern per file:
 
-- `main.go` — HTTP server, state, API handlers, gateway lifecycle
+- `main.go` — HTTP server, state, API handlers
 - `supervisor.go` — the process manager: starts, health-checks, restarts and orders every service; its `Agent()` is the only source of truth for the assistant's state
 - `setup.go` — the first-run stage table (`setupStages`); the single source of truth for installer steps
-- `runtime.go` — private Node.js and OpenClaw installation
-- `llama.go` — GPU backend choice, llama.cpp download, chat/embedding model servers, OpenClaw registration
+- `runtime.go` — data directory layout, child-process environment, HTTP and zip helpers
+- `llama.go` — GPU backend choice, llama.cpp download, chat/embedding model servers (with the DSpark draft)
 - `audio.go` — speech runtime (OmniVoice voice, Smart Turn), TTS and turn-detection endpoints
 - `whistle.go` — serves the speech-recognition model files to the page
-- `voice.go` — bridge from the dashboard to the OpenClaw gateway, gateway credentials, warm-up
+- `voice.go` — the dashboard's chat endpoint (streams an agent turn), agent warm-up
+- `agent.go` — the agent loop: prompt assembly, history fitting, streaming model calls, tool execution, approvals, saved sessions
+- `ai_gateway.go` — local model-call hooks, streamed generation events, and local marketplace intent routing
+- `agent_tools.go` — the tools the model can call; each has a `Guard` that decides when the user must approve
+- `skills.go` — `SKILL.md` discovery and loading
+- `memory.go` — persistent semantic search over workspace text, saved conversations and memory events, with a word-match fallback
+- `memory_events.go` — evidence-checked event extraction and the append-only memory event history
+- `state_events.go` — Go-owned work state and the server-sent event stream shared by dashboard tabs
+- `shell_windows.go`, `shell_other.go` — how the `shell` tool starts a command
 - `persona.go` — the workspace files that define the assistant's identity (see below)
 - `diagnose.go` — `/api/diagnose` install health report
 - `web/` — the embedded dashboard (HTML, CSS, ES modules); `web/vendor/` holds third-party code with licences
 - `assets/voices/` — optional reference voice, embedded at build time
 - `docs/` — plans and notes
 
-Keep model and runtime integration boundaries explicit: each external engine (llama.cpp, audio.cpp,
-OpenClaw) is started, health-checked and stopped from one file.
+Keep model and runtime integration boundaries explicit: each external engine (llama.cpp, audio.cpp)
+is started, health-checked and stopped from one file.
 
 ## Build, Test, and Development Commands
 
@@ -45,12 +53,16 @@ directory.
 
 ## Assistant identity and prompts
 
-OpenClaw documents no global system-prompt override, so identity lives in the workspace files it injects
-every turn. `persona.go` regenerates `IDENTITY.md`, `SOUL.md` and a marked block at the top of
+The agent loop injects the workspace files into every turn (`systemPrompt` in `agent.go`), so identity
+lives there. `persona.go` regenerates `IDENTITY.md`, `SOUL.md` and a marked block at the top of
 `AGENTS.md` from the profile on every start; `USER.md` and `MEMORY.md` are created once and never
-overwritten (the agent maintains them). Small models need explicit point of view, worked examples and
-short rules; change the text, then run `go test ./...` (the tests check names, placeholders and that
-user-owned files survive).
+overwritten (the agent maintains them through the `remember` tool). Small models need explicit point of
+view, worked examples and short rules; change the text, then run `go test ./...` (the tests check names,
+placeholders and that user-owned files survive).
+
+The chat model is MiniCPM-V 4.7 1B, a very small model: keep tool descriptions short and the tool count low,
+and put anything the model must not get wrong in a tool `Guard` or in code rather than in prose. Agent tests
+use `useFakeModel` (see `agent_test.go`) to script model replies, so they need no GPU.
 
 ## Testing Guidelines
 

@@ -1,0 +1,10 @@
+/* The exact key color is removed by the native layered window; orb pixels remain alpha blended. */
+:root{background:#010203;color-scheme:only dark}
+*{box-sizing:border-box}
+html,body{width:100%;height:100%;margin:0;overflow:hidden;background:#010203;user-select:none;-webkit-user-select:none}
+body{touch-action:none}
+.orb{position:absolute;inset:0;overflow:hidden;touch-action:none;cursor:grab}
+.orb:active{cursor:grabbing}
+.orb canvas{position:absolute;inset:0;width:100%;height:100%;pointer-events:auto}
+.orb.orb-fallback{display:grid;place-items:center}
+.orb-css{width:56%;aspect-ratio:1;border-radius:50%;background:radial-gradient(circle at 34% 30%,#a8f7ff,transparent 43%),radial-gradient(circle at 58% 65%,#2267ef,#4625af 66%,transparent 73%);box-shadow:0 0 34px #55c8ffb0;transform:scale(calc(1 + var(--level,0)*.12));transition:transform .08s linear}

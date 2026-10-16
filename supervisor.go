@@ -12,7 +12,7 @@ import (
 )
 
 // The supervisor is the app's process manager. Every long-running part (model servers,
-// speech server, speech-recognition files, OpenClaw Gateway, the warmed-up assistant) is a
+// speech server, speech-recognition files, the assistant's agent loop) is a
 // managed service with:
 //
 //	start    blocks until the service is healthy, or returns why it could not be
@@ -191,13 +191,11 @@ type agentStatus struct {
 func (s *supervisor) Agent() agentStatus {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	core := []string{svcGateway, svcModels, svcAssistant}
-	gateway := s.byName[svcGateway]
-	if gateway == nil || !gateway.wanted {
-		for _, name := range core {
-			if svc := s.byName[name]; svc != nil && svc.state == svcStopping && s.byName[svcGateway].state == svcStopping {
-				return agentStatus{State: "going-to-sleep", Label: "Going to sleep"}
-			}
+	core := []string{svcAgent, svcModels}
+	agent := s.byName[svcAgent]
+	if agent == nil || !agent.wanted {
+		if agent != nil && agent.state == svcStopping {
+			return agentStatus{State: "going-to-sleep", Label: "Going to sleep"}
 		}
 		return agentStatus{State: "asleep", Label: "Assistant is asleep"}
 	}
@@ -410,8 +408,8 @@ func (s *supervisor) stopService(svc *managedService, reason string) {
 }
 
 // evictOrphans stops anything still listening on our fixed ports from an earlier run of the
-// app (a crash or forced close leaves child processes behind, and a leftover Gateway owns
-// the state directory so a new one refuses to start). Call before anything is started.
+// app (a crash or forced close leaves child processes behind, and a leftover model server
+// would hold the port so a new one refuses to start). Call before anything is started.
 func evictOrphans(ports []int, logf func(string)) {
 	if runtime.GOOS != "windows" {
 		return
@@ -444,11 +442,11 @@ func evictOrphans(ports []int, logf func(string)) {
 // ---- the app's services ----------------------------------------------------
 
 const (
-	svcModels    = "models"
-	svcSpeech    = "speech"
-	svcWhistle   = "whistle"
-	svcGateway   = "gateway"
-	svcAssistant = "assistant"
+	svcModels  = "models"
+	svcSpeech  = "speech"
+	svcWhistle = "whistle"
+	svcAgent   = "agent"
+	svcWidget  = "widget"
 )
 
 func (a *app) newAppSupervisor() *supervisor {
@@ -466,17 +464,16 @@ func (a *app) newAppSupervisor() *supervisor {
 		name: svcWhistle, label: "Speech recognition",
 		start: a.ensureWhistle, stop: func() {}, healthy: a.whistleReady,
 	})
+	// The agent loop lives in this program, so "awake" only needs the language model. If the
+	// model restarts, the agent restarts with it and warms the new server up again.
 	s.add(&managedService{
-		name: svcGateway, label: "OpenClaw gateway",
-		start: a.startGatewayAndWait, stop: a.stopGateway, healthy: a.gatewayAlive,
+		name: svcAgent, label: "Assistant", needs: []string{svcModels},
+		start: a.startAgent, stop: func() { a.agentWarm.Store(false) }, healthy: func() bool { return a.llamaHealthy(llamaChatPort) },
 	})
-	// The assistant is "ready" once the gateway and the models are up and its first (slow)
-	// turn has run. If either restarts, the warm-up runs again.
+	// The desktop widget is optional: it is only wanted while the user has it switched on.
 	s.add(&managedService{
-		name: svcAssistant, label: "Assistant", needs: []string{svcGateway, svcModels},
-		start: func() error { a.warmGateway(); return nil },
-		stop:  func() { a.gwWarm.Store(false) },
-		healthy: a.gatewayReady,
+		name: svcWidget, label: "Desktop widget",
+		start: a.startWidget, stop: a.stopWidget, healthy: a.widgetHealthy,
 	})
 	return s
 }
@@ -485,7 +482,7 @@ func (a *app) newAppSupervisor() *supervisor {
 func (a *app) setServiceError(message string) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if message == "" && !a.serviceError && !strings.HasPrefix(a.state.Error, "Gateway exited") {
+	if message == "" && !a.serviceError {
 		return
 	}
 	a.serviceError = message != ""
@@ -498,16 +495,18 @@ func (a *app) superviseInstalled() {
 	for _, name := range []string{svcModels, svcSpeech, svcWhistle} {
 		a.sup.Want(name, true)
 	}
+	a.mu.Lock()
+	widget := a.state.WidgetEnabled
+	a.mu.Unlock()
+	a.sup.Want(svcWidget, widget)
 }
 
-// wakeAssistant and sleepAssistant are the user-facing on/off for the Gateway.
+// wakeAssistant and sleepAssistant are the user-facing on/off for the agent.
 func (a *app) wakeAssistant() {
 	a.superviseInstalled()
-	a.sup.Want(svcGateway, true)
-	a.sup.Want(svcAssistant, true)
+	a.sup.Want(svcAgent, true)
 }
 
 func (a *app) sleepAssistant() {
-	a.sup.Want(svcAssistant, false)
-	a.sup.Want(svcGateway, false)
+	a.sup.Want(svcAgent, false)
 }

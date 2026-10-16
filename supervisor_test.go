@@ -114,7 +114,9 @@ func TestSupervisorRestartsDependentsWhenANeedRestarts(t *testing.T) {
 	eventually(t, "both running", func() bool { return s.State("b") == svcRunning })
 	before := b.starts.Load()
 	a.up.Store(false)
-	eventually(t, "dependent started again", func() bool { return b.starts.Load() > before && s.State("b") == svcRunning && s.State("a") == svcRunning })
+	eventually(t, "dependent started again", func() bool {
+		return b.starts.Load() > before && s.State("b") == svcRunning && s.State("a") == svcRunning
+	})
 }
 
 func TestSupervisorAdoptsAServiceThatIsAlreadyUp(t *testing.T) {
@@ -142,28 +144,26 @@ func TestSupervisorStopsWhenNoLongerWanted(t *testing.T) {
 // The agent status is derived only from the services, so every reader sees the same answer.
 func TestAgentStatusIsDerivedFromServices(t *testing.T) {
 	s := newSupervisor(func(string) {}, func(string) {})
-	for _, name := range []string{svcModels, svcGateway} {
-		s.add(&managedService{name: name, label: name, start: func() error { return nil }, stop: func() {}, healthy: func() bool { return true }})
-	}
-	s.add(&managedService{name: svcAssistant, label: "assistant", needs: []string{svcGateway, svcModels}, start: func() error { return nil }, stop: func() {}, healthy: func() bool { return true }})
+	s.add(&managedService{name: svcModels, label: "models", start: func() error { return nil }, stop: func() {}, healthy: func() bool { return true }})
+	s.add(&managedService{name: svcAgent, label: "assistant", needs: []string{svcModels}, start: func() error { return nil }, stop: func() {}, healthy: func() bool { return true }})
 	if got := s.Agent().State; got != "asleep" {
 		t.Fatalf("nothing wanted: %s", got)
 	}
-	s.byName[svcGateway].wanted = true
+	s.byName[svcAgent].wanted = true
 	if got := s.Agent().State; got != "waking" {
 		t.Fatalf("wanted but not up: %s", got)
 	}
-	for _, name := range []string{svcModels, svcGateway, svcAssistant} {
+	for _, name := range []string{svcModels, svcAgent} {
 		s.byName[name].state, s.byName[name].generation = svcRunning, 1
 	}
 	if a := s.Agent(); a.State != "awake" || !a.Awake {
 		t.Fatalf("all running: %+v", a)
 	}
-	s.byName[svcGateway].state = svcBackoff
+	s.byName[svcAgent].state = svcBackoff
 	if got := s.Agent().State; got != "recovering" {
 		t.Fatalf("one restarting: %s", got)
 	}
-	s.byName[svcGateway].state, s.byName[svcGateway].lastErr = svcFailed, "port in use"
+	s.byName[svcAgent].state, s.byName[svcAgent].lastErr = svcFailed, "port in use"
 	if a := s.Agent(); a.State != "failed" || a.Detail == "" {
 		t.Fatalf("failed: %+v", a)
 	}
