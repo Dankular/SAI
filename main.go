@@ -60,10 +60,23 @@ type Snapshot struct {
 	WidgetPositionSet    bool     `json:"widgetPositionSet,omitempty"`
 	WidgetPositionX      float64  `json:"widgetPositionX,omitempty"` // normalized across the primary work area
 	WidgetPositionY      float64  `json:"widgetPositionY,omitempty"`
-	Schema               int      `json:"schema"` // version of the setup stage table the saved progress refers to
-	Step                 string   `json:"step"`
-	Error                string   `json:"error,omitempty"`
-	RecentLogs           []string `json:"recentLogs"`
+	// Settings page: a custom size (logical pixels; 0 uses the preset above), the spiral arms, and a
+	// colour per state ("#rrggbb"; a missing state keeps its stock colour).
+	WidgetWidth         int               `json:"widgetWidth,omitempty"`
+	WidgetHeight        int               `json:"widgetHeight,omitempty"`
+	WidgetNoSpiral      bool              `json:"widgetNoSpiral,omitempty"`
+	WidgetSpiralSize    float64           `json:"widgetSpiralSize,omitempty"` // 1 is stock; 0 means 1
+	WidgetColors        map[string]string `json:"widgetColors,omitempty"`
+	ChatModel           string            `json:"chatModel,omitempty"`
+	ModelSwitching      bool              `json:"modelSwitching,omitempty"`
+	ModelSwitchTarget   string            `json:"modelSwitchTarget,omitempty"`
+	ModelSwitchStatus   string            `json:"modelSwitchStatus,omitempty"`
+	ModelSwitchError    string            `json:"modelSwitchError,omitempty"`
+	ModelSwitchApplying bool              `json:"modelSwitchApplying,omitempty"`
+	Schema              int               `json:"schema"` // version of the setup stage table the saved progress refers to
+	Step                string            `json:"step"`
+	Error               string            `json:"error,omitempty"`
+	RecentLogs          []string          `json:"recentLogs"`
 }
 
 type app struct {
@@ -154,6 +167,8 @@ func main() {
 	mux.HandleFunc("/api/stop", a.handleStop)
 	mux.HandleFunc("/api/workspace", a.handleWorkspace)
 	mux.HandleFunc("/api/widget", a.handleWidget)
+	mux.HandleFunc("/api/widget/preview", a.handleWidgetPreview)
+	mux.HandleFunc("/api/model", a.handleModel)
 	mux.HandleFunc("/api/orb", a.handleOrb)
 	mux.HandleFunc("/api/agent/approve", a.handleApprove)
 	mux.HandleFunc("/api/agent/reset", a.handleAgentReset)
@@ -232,7 +247,7 @@ func sovereignAIDataDir() (string, error) {
 const stateSchema = 3
 
 func (a *app) load() error {
-	a.state = Snapshot{RecentLogs: []string{}, StageLabels: stageLabels()}
+	a.state = Snapshot{ChatModel: chatModels[0].ID, RecentLogs: []string{}, StageLabels: stageLabels()}
 	data, err := os.ReadFile(a.statePath)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
@@ -259,6 +274,16 @@ func (a *app) load() error {
 		// reported again by the process manager.
 		a.state.Error = ""
 		a.state.Step = "Your local assistant is ready"
+	}
+	if _, ok := chatModelByID(a.state.ChatModel); !ok {
+		a.state.ChatModel = chatModels[0].ID
+	}
+	if a.state.ModelSwitching {
+		a.state.ModelSwitching = false
+		a.state.ModelSwitchApplying = false
+		a.state.ModelSwitchTarget = ""
+		a.state.ModelSwitchStatus = "The previous model change was interrupted."
+		a.state.ModelSwitchError = "The app closed before the model change finished. The previous model is still selected."
 	}
 	a.state.Updating = false
 	a.resumeSetup = a.state.SetupRunning || (a.state.Profile.UserName != "" && a.state.Profile.AgentName != "" && a.state.Profile.Purpose != "" && !a.state.SetupComplete && a.state.Error == "")
@@ -612,6 +637,11 @@ func (a *app) recordDownloadProgress(label string, received, total int64, percen
 	}
 	a.mu.Lock()
 	a.state.ProgressDetail = detail
+	if a.state.ModelSwitching && !a.state.ModelSwitchApplying {
+		if model, ok := chatModelByID(a.state.ModelSwitchTarget); ok && model.File == label {
+			a.state.ModelSwitchStatus = detail
+		}
+	}
 	if percent >= 0 && a.state.ProgressTotal > 0 {
 		a.stagePercent = percent
 		a.state.ProgressStagePercent = percent
@@ -882,7 +912,7 @@ func openBrowser(address string) {
 // vendored scripts, and the JSON API.
 func publicPath(p string) bool {
 	switch p {
-	case "/", "/style.css", "/dashboard.css", "/app.js", "/orb.js", "/neuron.js", "/hud.js", "/widget.html", "/widget.js", "/widget.css", "/voice.js", "/vad.js", "/stt.js", "/stt-worker.js", "/listen.js", "/capture-worklet.js", "/favicon.ico":
+	case "/", "/style.css", "/dashboard.css", "/app.js", "/orb.js", "/neuron.js", "/hud.js", "/widget.html", "/widget.js", "/widget.css", "/voice.js", "/vad.js", "/stt.js", "/stt-worker.js", "/listen.js", "/capture-worklet.js", "/memory.js", "/settings.js", "/favicon.ico":
 		return true
 	}
 	return strings.HasPrefix(p, "/api/") || strings.HasPrefix(p, "/vendor/") || strings.HasPrefix(p, "/models/whistle/")

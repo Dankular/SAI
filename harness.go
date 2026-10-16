@@ -32,6 +32,7 @@ type harnessPlan struct {
 	Tools  map[string]bool // tools the model may use this turn; nil means all
 	Wrote  bool            // the harness changed the notes this turn
 	Forget string          // what the user asked to forget (the conversation is cleaned of it as well)
+	Route  string          // short, stable label for local diagnostics
 }
 
 type harnessRuntime struct {
@@ -63,8 +64,8 @@ func (a *app) harnessPlanFor(session string) *harnessPlan {
 	return a.harness.plans[session]
 }
 
-// harnessBeforeCall hands the plan to the model call: the notes become context and the tool list is
-// narrowed. The model's own copy of the schemas is all that changes; tools still execute from the full list.
+// harnessBeforeCall hands the plan to the model call: notes become context and the
+// schemas are narrowed to the same set that the executor is allowed to run.
 func (a *app) harnessBeforeCall(ctx context.Context, call *modelGatewayCall) error {
 	plan := a.harnessPlanFor(call.Session)
 	if plan == nil {
@@ -104,9 +105,25 @@ var (
 
 // harnessPlan decides what happens to one user message. It performs the memory writes it reports.
 func (a *app) harnessPlan(text string, now time.Time) *harnessPlan {
+	return a.harnessPlanWithContext(text, now, "")
+}
+
+func (a *app) harnessPlanWithContext(text string, now time.Time, priorContext string) *harnessPlan {
 	plan := &harnessPlan{}
 	text = strings.TrimSpace(text)
 	if text == "" {
+		return plan
+	}
+	if factRequestRE.MatchString(text) && wikipediaMentionRE.MatchString(text+"\n"+priorContext) {
+		plan.Route = "wikipedia_fact"
+		lookupCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		fact, err := a.wikipediaRandomFact(lookupCtx)
+		cancel()
+		if err != nil {
+			plan.Direct = "I couldn't fetch a Wikipedia page just now, so I can't give you a verified fact."
+		} else {
+			plan.Direct = fact
+		}
 		return plan
 	}
 	name := firstName(a.profile().UserName)
@@ -223,9 +240,30 @@ func (a *app) harnessPlan(text string, now time.Time) *harnessPlan {
 	return plan
 }
 
+func harnessRouteLabel(plan *harnessPlan) string {
+	if plan == nil {
+		return "model"
+	}
+	if strings.TrimSpace(plan.Route) != "" {
+		return plan.Route
+	}
+	if plan.Direct != "" {
+		return "direct"
+	}
+	if len(plan.Notes) > 0 {
+		return "context"
+	}
+	return "model"
+}
+
 // webLookupRE picks out questions about the changing world, which a model with no internet cannot answer
 // and a small one will not think to look up.
 var webLookupRE = regexp.MustCompile(`(?i)\b(latest|newest|current(?:ly)?|right now|these days|this week|tonight|news|weather|forecast|price of|how much (?:does|is) .* cost|score of|who (?:is|are) the (?:current |new )?(?:president|prime minister|ceo|king|queen|mayor|governor|leader)|(?:stock|share) price|exchange rate|opening hours|release date|when (?:does|is|did) .* (?:release|come out|launch))\b`)
+
+var (
+	factRequestRE      = regexp.MustCompile(`(?i)\b(?:find|tell|give|share|show|pick|choose)\b.{0,60}\b(?:a|any|one|some|random|interesting)?\s*fact\b|\bany\s+(?:interesting\s+)?fact\b`)
+	wikipediaMentionRE = regexp.MustCompile(`(?i)\bwikipedia\b`)
+)
 
 // prefetchWeb runs the search itself, so the model only has to read the answer. A message containing
 // something secret-looking from the notes is never sent.
@@ -307,12 +345,12 @@ func sayCalculation(original, expr string) string {
 // --- tools for the turn ----------------------------------------------------------
 
 var (
-	fileWordsRE   = regexp.MustCompile(`(?i)\b(file|files|folder|directory|document|read|write|edit|create|rename|open|workspace|patch|\.txt|\.md|\.json|\.go|\.py|\.js)\b|\.\w{1,4}\b`)
-	shellWordsRE  = regexp.MustCompile(`(?i)\b(shell|command|run|terminal|bash|powershell|script|install|git|npm|pip|compile|build|process|server|ping|grep)\b`)
-	webWordsRE    = regexp.MustCompile(`(?i)\b(search|web|google|look up|lookup|online|internet|latest|newest|news|weather|website|http|https|url|price|stock|score|release|version|who is|who was|when did|wikipedia)\b`)
+	fileWordsRE       = regexp.MustCompile(`(?i)\b(file|files|folder|directory|document|read|write|edit|create|rename|open|workspace|patch|code word|\.txt|\.md|\.json|\.go|\.py|\.js)\b|\.\w{1,4}\b`)
+	shellWordsRE      = regexp.MustCompile(`(?i)\b(shell|command|run|terminal|bash|powershell|script|install|git|npm|pip|compile|build|process|server|ping|grep)\b`)
+	webWordsRE        = regexp.MustCompile(`(?i)\b(search|web|google|look up|lookup|online|internet|latest|newest|news|weather|website|http|https|url|price|stock|score|release|version|who is|who was|when did|wikipedia)\b`)
 	memoryEditWordsRE = regexp.MustCompile(`(?i)\b(pin|unpin|correct(?:ion)?|update (?:my|that|the)|change (?:my|that|the)|no longer|not anymore|actually,? (?:i|my)|keep (?:that|this) in mind)\b`)
-	scheduleWordsRE = regexp.MustCompile(`(?i)\b(remind|reminders?|schedule[ds]?|alarm|timer|every (?:day|week|hour|morning|evening|\d+ )|daily|hourly|recurring|cron|scheduled)\b`)
-	memoryWordsRE = regexp.MustCompile(`(?i)\b(remember|recall|my|did i|told you|notes?|earlier|last time|before|yesterday|appointment|password|where did|when is|what was)\b`)
+	scheduleWordsRE   = regexp.MustCompile(`(?i)\b(remind|reminders?|schedule[ds]?|alarms?|timer|every (?:day|week|hour|morning|evening|\d+ )|daily|hourly|recurring|cron|scheduled)\b`)
+	memoryWordsRE     = regexp.MustCompile(`(?i)\b(remember|recall|my|did i|told you|notes?|earlier|last time|before|yesterday|appointment|password|where did|when is|what was)\b`)
 )
 
 // toolsFor lists the tools worth offering for a message. Fewer tools means fewer wrong calls and a

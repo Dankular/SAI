@@ -37,8 +37,11 @@ func (a *app) diagnose() []diagCheck {
 	} else {
 		add("llama.cpp runtime", false, "no backend installed under "+a.llamaRoot())
 	}
-	fileCheck("Chat model (MiniCPM-V 4.7 1B)", a.chatModel())
-	fileCheck("Speculative-decoding draft (DSpark)", a.draftModel())
+	model := a.selectedChatModel()
+	fileCheck("Chat model ("+model.Name+")", a.chatModel())
+	if a.selectedChatModel().Draft != nil {
+		fileCheck("Speculative-decoding draft (DSpark)", a.draftModel())
+	}
 	fileCheck("Embedding model", a.embedModel())
 	add("Workspace POSIX userland", a.workspaceUserlandReady(), a.userlandDir())
 	if exe, ok := findFile(a.audioRoot(), "audiocpp_server.exe"); ok {

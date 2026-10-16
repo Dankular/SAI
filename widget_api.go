@@ -183,11 +183,21 @@ func (a *app) handleOrb(w http.ResponseWriter, r *http.Request) {
 // handleWidget accepts settings or a normalized desktop position. During a drag the client marks
 // intermediate coordinates as transient; the final update persists them once the pointer is released.
 func (a *app) handleWidget(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodGet { // the Settings page reads the current values here
+		a.mu.Lock()
+		view, enabled, corner := widgetViewOf(a.state), a.state.WidgetEnabled, a.state.WidgetCorner
+		a.mu.Unlock()
+		if corner == "" {
+			corner = "top-right"
+		}
+		writeJSON(w, map[string]any{"enabled": enabled, "corner": corner, "appearance": view})
+		return
+	}
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	r.Body = http.MaxBytesReader(w, r.Body, 1024)
+	r.Body = http.MaxBytesReader(w, r.Body, 4096)
 	var in struct {
 		Enabled  *bool    `json:"enabled"`
 		Corner   *string  `json:"corner"`
@@ -195,6 +205,13 @@ func (a *app) handleWidget(w http.ResponseWriter, r *http.Request) {
 		X        *float64 `json:"x"`
 		Y        *float64 `json:"y"`
 		Dragging *bool    `json:"dragging"`
+		// the Settings page
+		Width      *int              `json:"width"`
+		Height     *int              `json:"height"`
+		Spiral     *bool             `json:"spiral"`
+		SpiralSize *float64          `json:"spiralSize"`
+		Colors     map[string]string `json:"colors"`
+		Reset      *bool             `json:"reset"`
 	}
 	if json.NewDecoder(r.Body).Decode(&in) != nil {
 		http.Error(w, "invalid widget settings", http.StatusBadRequest)
@@ -226,11 +243,22 @@ func (a *app) handleWidget(w http.ResponseWriter, r *http.Request) {
 			a.state.WidgetPositionX, a.state.WidgetPositionY = 0, 0
 		}
 	}
+	resize := false
 	if in.Size != nil {
 		if _, ok := widgetSizes[*in.Size]; ok {
+			beforeW, beforeH := widgetLogicalSize(a.state)
 			a.state.WidgetSize, relayout = *in.Size, true
+			afterW, afterH := widgetLogicalSize(a.state)
+			resize = afterW != beforeW || afterH != beforeH
 		}
 	}
+	changed, problem := applyWidgetAppearance(&a.state, widgetAppearance{Width: in.Width, Height: in.Height, Spiral: in.Spiral, SpiralSize: in.SpiralSize, Colors: in.Colors, Reset: in.Reset})
+	if problem != "" {
+		a.mu.Unlock()
+		http.Error(w, problem, http.StatusBadRequest)
+		return
+	}
+	resize = resize || changed
 	if in.Enabled != nil {
 		a.state.WidgetEnabled = *in.Enabled
 	}
@@ -242,10 +270,17 @@ func (a *app) handleWidget(w http.ResponseWriter, r *http.Request) {
 	if in.Enabled != nil {
 		a.sup.Want(svcWidget, enabled)
 	}
-	if relayout && enabled {
+	if resize && enabled {
+		if a.sup != nil {
+			a.sup.Restart(svcWidget) // the drawing surface is made at one size, so a new size needs a new widget
+		}
+	} else if relayout && enabled {
 		a.applyWidgetLayout()
 	}
-	writeJSON(w, map[string]any{"ok": true, "enabled": enabled})
+	a.mu.Lock()
+	view := widgetViewOf(a.state)
+	a.mu.Unlock()
+	writeJSON(w, map[string]any{"ok": true, "enabled": enabled, "appearance": view})
 }
 
 // updateWidgetPosition records a native drag in the same normalized position format used by the

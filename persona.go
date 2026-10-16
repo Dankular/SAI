@@ -26,7 +26,7 @@ const (
 	rulesEnd      = "<!-- sovereign-ai:rules:end -->"
 
 	// Accurate facts about the model, so it never has to guess.
-	modelFacts = "MiniCPM-V 4.7 1B, an open Apache-2.0 model from OpenBMB with about one billion parameters, running locally through llama.cpp"
+	modelFacts = "MiniCPM5 2B, an open Apache-2.0 model from OpenBMB with about two billion parameters, running locally through llama.cpp"
 )
 
 func (a *app) writePersona(p Profile) error {
@@ -48,7 +48,8 @@ func (a *app) writePersona(p Profile) error {
 	if first {
 		managed, once = a.writeForced, a.writeForced
 	}
-	if err := managed("IDENTITY.md", identityFile(agent, user)); err != nil {
+	model := a.selectedChatModel()
+	if err := managed("IDENTITY.md", identityFileForModel(agent, user, model.Name+" ("+model.Quant+"), running locally through llama.cpp")); err != nil {
 		return err
 	}
 	if err := managed("SOUL.md", soulFile(agent, user, p)); err != nil {
@@ -84,7 +85,11 @@ func (a *app) writeForced(name, contents string) error {
 }
 
 func identityFile(agent, user string) string {
-	return strings.NewReplacer("{agent}", agent, "{user}", user, "{model}", modelFacts).Replace(managedMarker + `
+	return identityFileForModel(agent, user, modelFacts)
+}
+
+func identityFileForModel(agent, user, model string) string {
+	return strings.NewReplacer("{agent}", agent, "{user}", user, "{model}", model).Replace(managedMarker + `
 # Identity
 
 You are {agent}, {user}'s personal assistant. You run privately on {user}'s own computer, and nothing leaves it unless {user} chooses an outside service.

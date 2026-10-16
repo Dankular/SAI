@@ -39,6 +39,12 @@ persistent vector store. Source files are in the repository root, one concern pe
 - `mcp_use.go` — `action=use`: tool arguments decoded under the tool's own input schema, filler removed, missing required values asked for; successes are remembered (`mcp-usage.json`) and draft a skill for approval
 - `builtin_skills.go` — the shipped `find-mcp-tool` skill, written once to the shared skills folder
 - `legacy.go` — cleanup of earlier releases. Inside the app folder (OpenClaw runtime, private Node.js, the Agents-A1 model in any quantisation) things are deleted; outside it (`~\.clawdbot`, `%LOCALAPPDATA%\openclaw`, the global npm package and shims) each item is verified, then *retired* to `<data>etired` and deleted after 14 days, never while an OpenClaw gateway answers, never with `SOVEREIGNAI_KEEP_LEGACY` set
+- `orb_mesh.go` — the desktop orb's sphere, ported from `web/orb.js` so the two look alike: a geodesic icosphere (three's IcosahedronGeometry(2, 9)) displaced by the same simplex noise, shaded with the web shaders' own formulas, every triangle edge drawn, an analytic halo. `orb_render.go` draws the layers in the web scene's order (surface, neuron, mesh, halo, then the galaxy additively on top) with the web camera (46 degrees, 15 units back), so the sphere is a fixed fraction of the frame HEIGHT. Compare the two with a PNG export of a native frame and a headless-Edge screenshot of the web page; do not trust a flat side-by-side look
+- `widget_settings.go` — what the Settings page controls for the desktop widget (width, height, spiral on/off and size, a colour per state), validated and saved in `state.json`; `GET /api/widget` reads them, `POST` changes them, `GET /api/widget/preview` draws one frame with the renderer. A new size restarts the widget (`supervisor.Restart`), because its drawing surface is made at one size. `web/settings.js` is the page
+- `orb_draw.go` — how the orb is drawn fast: row bands spread over a few threads (a band never writes outside its rows, so one thread and many give the identical picture; tested), lookup tables instead of per-pixel `pow`/`exp`, and per-frame worker counts (`orbWorkersFor`). The widget draws calm at 12-20 fps and busy (voice, a pulse, thinking, a state change) at 60 (`orbWantsFullRate`), presents at 30/60 Hz whatever the monitor does, and reuses its frame buffers. Measure CPU with the process cycle counter (`QueryProcessCycleTime`), not `Get-Process` CPU time, which is sampled at ~15 ms ticks and badly undercounts a loop like this
+- `profile_debug.go` — set `SOVEREIGNAI_PROFILE_DIR` and the app writes a 20 s CPU profile of itself (from 25 s after launch) to `cpu.pprof`; read it with `go tool pprof SovereignAI.exe cpu.pprof`
+- The orb's simplex noise (`orbSimplex`) must do its hash arithmetic in float32 like the GPU: in float64, exact multiples of 7 and 49 round the other way and give noise of +-4 instead of +-1, which made the sphere explode at high voice levels. It is checked against values read back from the real shader (`orb_fidelity_test.go`). To check a port against the GPU, render the shader in headless Edge with its own `--user-data-dir`, a `file:///C:/...` page (not an MSYS `/c/...` path) and `--timeout`, and read pixels back
+- Every script the dashboard loads must be on the `publicPath` allowlist in `main.go`; `TestEveryAssetTheDashboardNamesIsServed` checks it. A file that is embedded but not listed is a silent 404 and its feature never starts
 - `processimage_*.go` — a process's program path; `evictOrphans` (in `supervisor.go`) only stops a leftover server whose program lives inside this install's `runtime` folder, so a second copy of the app can never kill the first one's servers
 
 The system prompt is deliberately stable (no clock, no retrieved memory) so llama-server can reuse its prompt cache; per-turn context goes through `volatileContext`. Unattended work (scheduled tasks, heartbeat) gets `unattendedTools` and a step cap via `turnOptions.AllowTools/MaxSteps`.
@@ -83,9 +89,10 @@ overwritten (the agent maintains them through the `remember` tool). Small models
 view, worked examples and short rules; change the text, then run `go test ./...` (the tests check names,
 placeholders and that user-owned files survive).
 
-The chat model is MiniCPM-V 4.7 1B, a very small model: keep tool descriptions short and the tool count low,
-and put anything the model must not get wrong in a tool `Guard` or in code rather than in prose. Agent tests
-use `useFakeModel` (see `agent_test.go`) to script model replies, so they need no GPU.
+The default chat model is MiniCPM5 2B (with its DSpark draft, `chatModels[].Draft`). Settings can also select MiniCPM5 1B, Nanbeige4.1 3B, Qwen3.5-4B, Ministral 3 3B, Phi-4-mini,
+or LFM2.5-2.6B. Keep tool descriptions short and put anything a local model must not get wrong in a tool
+`Guard` or in code rather than in prose. Agent tests use `useFakeModel` (see `agent_test.go`) to script
+model replies, so they need no GPU.
 
 ## Testing Guidelines
 

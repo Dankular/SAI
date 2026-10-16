@@ -40,7 +40,7 @@ type apiMemory struct {
 }
 
 func (a *app) memorySnapshot() apiMemory {
-	out := apiMemory{Notes: []apiNote{}, Events: []apiEvent{}, Jobs: a.listCronJobs(), Skills: append([]skillProposal{}, a.listSkillProposals()...)}
+	out := apiMemory{Notes: []apiNote{}, Events: []apiEvent{}, Jobs: append([]cronJob{}, a.listCronJobs()...), Skills: append([]skillProposal{}, a.listSkillProposals()...)}
 	for _, name := range []string{"USER.md", "MEMORY.md"} {
 		data, err := os.ReadFile(filepath.Join(a.workspace, name))
 		if err != nil {

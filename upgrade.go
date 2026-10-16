@@ -53,12 +53,18 @@ func installPieces() []installPiece {
 		{
 			label:   "the language model",
 			present: func(a *app) bool { return isFile(a.chatModel()) },
-			fetch:   func(a *app) error { return a.ensureModel(chatRepo, chatFile, a.chatModel()) },
+			fetch: func(a *app) error {
+				model := a.selectedChatModel()
+				return a.ensureModel(model.Repo, model.File, a.chatModel())
+			},
 		},
 		{
 			label:    "the speed-up model",
-			present:  func(a *app) bool { return isFile(a.draftModel()) },
-			fetch:    func(a *app) error { return a.ensureModel(draftRepo, draftFile, a.draftModel()) },
+			present:  func(a *app) bool { return a.selectedChatModel().Draft == nil || isFile(a.draftModel()) },
+			fetch: func(a *app) error {
+				draft := a.selectedChatModel().Draft
+				return a.ensureModel(draft.Repo, draft.File, a.draftModel())
+			},
 			optional: true,
 		},
 		{

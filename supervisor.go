@@ -1,10 +1,10 @@
 package main
 
 import (
-	"path/filepath"
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
@@ -63,6 +63,7 @@ type managedService struct {
 	generation int            // increments each time the service becomes running
 	needGen    map[string]int // generation of each need when this service last started
 	busy       bool           // a start/stop/probe for this service is in flight
+	restart    bool           // restart it once, now, without waiting for it to fail
 }
 
 // serviceStatus is what the dashboard and /api/state show.
@@ -142,6 +143,87 @@ func (s *supervisor) wake() {
 }
 
 // Want says whether a service should be running. Asking for it again after it failed retries it.
+// Restart asks a running service to be stopped and started again, once. Nothing happens to a service
+// that is not running, and a service nobody wants stays off.
+func (s *supervisor) Restart(name string) {
+	s.mu.Lock()
+	if svc := s.byName[name]; svc != nil && svc.state == svcRunning {
+		svc.restart = true
+	}
+	s.mu.Unlock()
+	s.wake()
+}
+
+// RestartAndWait restarts a wanted, running service and waits for the replacement generation
+// to become healthy. If the service is not running, its next normal start will use new settings.
+func (s *supervisor) RestartAndWait(name string, timeout time.Duration) error {
+	s.mu.Lock()
+	svc := s.byName[name]
+	if svc == nil {
+		s.mu.Unlock()
+		return fmt.Errorf("unknown service %q", name)
+	}
+	if !svc.wanted {
+		s.mu.Unlock()
+		return nil
+	}
+	generation := svc.generation
+	wasStarting := svc.state == svcStarting
+	if svc.state == svcRunning {
+		svc.restart = true
+	}
+	s.mu.Unlock()
+	s.wake()
+
+	deadline := time.NewTimer(timeout)
+	defer deadline.Stop()
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		s.mu.Lock()
+		state, currentGeneration, lastErr := svc.state, svc.generation, svc.lastErr
+		wanted := svc.wanted
+		s.mu.Unlock()
+		if currentGeneration > generation && state == svcRunning {
+			if !wasStarting {
+				return nil
+			}
+			// If startup had already begun when a setting changed, restart once more so
+			// a model path captured just before the change cannot remain active.
+			s.mu.Lock()
+			if svc.wanted && svc.state == svcRunning {
+				generation = svc.generation
+				svc.restart = true
+				s.mu.Unlock()
+				s.wake()
+				wasStarting = false
+				continue
+			}
+			s.mu.Unlock()
+			return nil
+		}
+		if !wanted {
+			return fmt.Errorf("%s stopped during restart", svc.label)
+		}
+		if state == svcFailed {
+			return fmt.Errorf("%s could not restart: %s", svc.label, lastErr)
+		}
+		select {
+		case <-deadline.C:
+			return fmt.Errorf("timed out waiting for %s to restart", svc.label)
+		case <-ticker.C:
+		}
+	}
+}
+
+func (s *supervisor) takeRestart(svc *managedService) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	was := svc.restart
+	svc.restart = false
+	return was
+}
+
 func (s *supervisor) Want(name string, want bool) {
 	s.mu.Lock()
 	svc := s.byName[name]
@@ -296,6 +378,8 @@ func (s *supervisor) step(svc *managedService) {
 		// stays failed until Want(true) is asked again
 	case state == svcRunning && (!needsOK || needsChanged):
 		s.stopService(svc, svc.label+" is restarting because something it depends on restarted")
+	case state == svcRunning && s.takeRestart(svc):
+		s.stopService(svc, "") // it is started again on the next pass, because it is still wanted
 	case state == svcRunning:
 		s.probe(svc)
 	case !needsOK:

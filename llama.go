@@ -30,14 +30,7 @@ import (
 const (
 	llamaChatPort  = 19432
 	llamaEmbedPort = 19433
-	chatModelID    = "minicpm-v-4.7-1b"
 	embedModelID   = "embeddinggemma-2"
-	chatRepo       = "openbmb/MiniCPM-V-4.7-1B-gguf"
-	chatFile       = "MiniCPM-V-4_7-1B-Q8_0.gguf"
-	// DSpark draft: a small model trained to pair with the chat model. It proposes up to 15 tokens at a
-	// time and the chat model verifies them, so replies come out several times faster with identical text.
-	draftRepo   = "openbmb/MiniCPM-V-4.7-1B-DSpark-gguf"
-	draftFile   = "dspark-MiniCPM-V-4_7-1B-Q8_0.gguf"
 	embedRepo   = "ggml-org/embeddinggemma-2-GGUF"
 	embedFile   = "embeddinggemma-2-Q8_0.gguf"
 	chatContext = 32768 // the agent prompt is ~4k tokens; the rest is conversation and tool output
@@ -64,11 +57,19 @@ type ghRelease struct {
 	Assets []ghAsset `json:"assets"`
 }
 
-func (a *app) llamaRoot() string  { return filepath.Join(a.runtimeDir(), "llama") }
-func (a *app) modelsDir() string  { return filepath.Join(a.runtimeDir(), "models") }
-func (a *app) chatModel() string  { return filepath.Join(a.modelsDir(), chatFile) }
-func (a *app) draftModel() string { return filepath.Join(a.modelsDir(), draftFile) }
-func (a *app) embedModel() string { return filepath.Join(a.modelsDir(), embedFile) }
+func (a *app) llamaRoot() string   { return filepath.Join(a.runtimeDir(), "llama") }
+func (a *app) modelsDir() string   { return filepath.Join(a.runtimeDir(), "models") }
+func (a *app) chatModel() string   { return filepath.Join(a.modelsDir(), a.selectedChatModel().File) }
+func (a *app) chatModelID() string { return a.selectedChatModel().ID }
+// draftModel is the selected model's DSpark draft file, or "" when it has none.
+func (a *app) draftModel() string {
+	draft := a.selectedChatModel().Draft
+	if draft == nil {
+		return ""
+	}
+	return filepath.Join(a.modelsDir(), draft.File)
+}
+func (a *app) embedModel() string  { return filepath.Join(a.modelsDir(), embedFile) }
 
 func (a *app) llamaBackendName() string {
 	a.llama.backendMu.Lock()
@@ -518,12 +519,12 @@ func (a *app) launchLlama(backend, dir string) error {
 	}{
 		// One slot: parallel slots would split the context window between requests. The 8-bit KV cache
 		// keeps the larger window within the same VRAM.
-		{"chat", llamaChatPort, a.chatModel(), []string{"--alias", chatModelID, "-c", strconv.Itoa(chatContext), "--jinja", "-np", "1", "-fa", "on", "--cache-type-k", "q8_0", "--cache-type-v", "q8_0"}},
+		{"chat", llamaChatPort, a.chatModel(), []string{"--alias", a.chatModelID(), "-c", strconv.Itoa(chatContext), "--jinja", "-np", "1", "-fa", "on", "--cache-type-k", "q8_0", "--cache-type-v", "q8_0"}},
 		{"embeddings", llamaEmbedPort, a.embedModel(), []string{"--alias", embedModelID, "--embeddings", "-c", "2048", "-b", "2048", "-ub", "2048"}},
 	}
 	for _, server := range servers {
-		if server.name == "chat" && isFile(a.draftModel()) && os.Getenv("SOVEREIGNAI_NO_DRAFT") == "" {
-			draft := append(append([]string{}, server.args...), "-md", a.draftModel(), "--spec-type", "draft-dspark", "--spec-draft-n-max", "15", "-ngld", "99")
+		if server.name == "chat" && a.selectedChatModel().Draft != nil && isFile(a.draftModel()) && os.Getenv("SOVEREIGNAI_NO_DRAFT") == "" {
+			draft := append(append([]string{}, server.args...), "-md", a.draftModel(), "--spec-type", "draft-dspark", "--spec-draft-n-max", strconv.Itoa(a.selectedChatModel().Draft.MaxTokens), "-ngld", "99")
 			if err := a.launchLlamaServer(dir, server.name, server.port, server.model, draft); err == nil {
 				a.recordCommandOutput("Speculative decoding (DSpark) is on")
 				continue

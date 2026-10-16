@@ -10,12 +10,25 @@ func TestRenderOrbFrameLeavesEmptyPixelsTransparent(t *testing.T) {
 	if got, want := len(frame), 180*200*4; got != want {
 		t.Fatalf("frame length = %d, want %d", got, want)
 	}
-	if got := frame[3]; got != 0 {
-		t.Fatalf("corner alpha = %d, want transparent", got)
-	}
 	center := (100*180 + 90) * 4
 	if got := frame[center+3]; got == 0 {
 		t.Fatal("orb center is transparent")
+	}
+	// Like the web orb, the arms sweep across the whole frame, so the corner may be lit; but the
+	// gaps between them stay transparent, which is what lets clicks and the wallpaper through.
+	clear := 0
+	for i := 3; i < len(frame); i += 4 {
+		if frame[i] == 0 {
+			clear++
+		}
+	}
+	if clear < len(frame)/4*15/100 {
+		t.Fatalf("only %d of %d pixels are transparent", clear, len(frame)/4)
+	}
+	// With the spiral off, only the sphere and its glow remain, so the corners are empty.
+	bare := renderOrbFrameWithInputs(180, 200, orbFrameInputs{State: "active", StimulusAgeMs: -1, FlashAgeMs: -1, Style: orbStyle{NoSpiral: true}}, 0.5)
+	if bare[3] != 0 || bare[len(bare)-1] != 0 {
+		t.Fatalf("corner alpha = %d / %d with no spiral, want transparent", bare[3], bare[len(bare)-1])
 	}
 }
 

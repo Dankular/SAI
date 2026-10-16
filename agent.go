@@ -15,6 +15,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 )
 
 // The agent loop runs inside this program. It replaces the OpenClaw gateway: the same idea
@@ -191,10 +192,83 @@ func (a *app) systemPrompt(now time.Time) string {
 // approxTokens is a deliberately rough size estimate (about 3.3 characters per token).
 func approxTokens(s string) int { return len(s)*10/33 + 4 }
 
+func filterAgentTools(tools []agentTool, allowed map[string]bool) []agentTool {
+	if allowed == nil {
+		return tools
+	}
+	filtered := make([]agentTool, 0, len(allowed))
+	for _, tool := range tools {
+		if allowed[tool.Name] {
+			filtered = append(filtered, tool)
+		}
+	}
+	return filtered
+}
+
+func toolSchemasFor(tools []agentTool) ([]map[string]any, int) {
+	schemas := make([]map[string]any, 0, len(tools))
+	tokens := 0
+	for _, tool := range tools {
+		schema := map[string]any{"type": "function", "function": map[string]any{"name": tool.Name, "description": tool.Description, "parameters": tool.Parameters}}
+		schemas = append(schemas, schema)
+		encoded, _ := json.Marshal(schema)
+		tokens += approxTokens(string(encoded))
+	}
+	return schemas, tokens
+}
+
+// middleClipBytes keeps both ends of a long request and clips only at UTF-8 boundaries.
+func middleClipBytes(s string, maxBytes int) string {
+	if maxBytes <= 0 {
+		return ""
+	}
+	if len(s) <= maxBytes {
+		return s
+	}
+	marker := "\n[truncated]\n"
+	if maxBytes <= len(marker) {
+		return marker[:maxBytes]
+	}
+	remaining := maxBytes - len(marker)
+	headEnd := remaining / 2
+	for headEnd > 0 && !utf8.ValidString(s[:headEnd]) {
+		headEnd--
+	}
+	tailStart := len(s) - (remaining - headEnd)
+	for tailStart < len(s) && !utf8.ValidString(s[tailStart:]) {
+		tailStart++
+	}
+	return s[:headEnd] + marker + s[tailStart:]
+}
+
+func clipToTokenBudget(s string, budget int) string {
+	if budget < 1 {
+		return ""
+	}
+	maxBytes := (budget - 4) * 33 / 10
+	if maxBytes < 1 {
+		return middleClipBytes(s, budget)
+	}
+	return middleClipBytes(s, maxBytes)
+}
+
+func memoryRetrievalQuery(current, recent string) string {
+	current = strings.TrimSpace(current)
+	recent = strings.TrimSpace(recent)
+	if recent == "" {
+		return middleClipBytes("Current request: "+current, 1200)
+	}
+	query := "Current request: " + current + "\nRecent user requests:\n" + recent
+	return middleClipBytes(query, 1200)
+}
+
 // fitHistory returns the newest messages that fit in budget tokens, starting at a user
 // message so a tool result is never separated from the call that produced it. Old tool
-// output is shortened first, since it is rarely needed again.
+// output is shortened first; an oversized current request is clipped at both ends.
 func fitHistory(msgs []chatMsg, budget int) []chatMsg {
+	if budget < 1 || len(msgs) == 0 {
+		return nil
+	}
 	out := make([]chatMsg, len(msgs))
 	copy(out, msgs)
 	lastUser := 0
@@ -207,6 +281,9 @@ func fitHistory(msgs []chatMsg, budget int) []chatMsg {
 		if out[i].Role == "tool" && i < lastUser && len(out[i].Content) > 500 {
 			out[i].Content = out[i].Content[:500] + "\n[shortened]"
 		}
+	}
+	if out[lastUser].Role == "user" {
+		out[lastUser].Content = clipToTokenBudget(out[lastUser].Content, budget)
 	}
 	size := func(m chatMsg) int {
 		n := approxTokens(m.Content)
@@ -227,7 +304,7 @@ func fitHistory(msgs []chatMsg, budget int) []chatMsg {
 		start++
 	}
 	if start == len(out) && len(out) > 0 {
-		start = lastUser // always keep at least the current request
+		start = lastUser // always keep at least the bounded current request
 	}
 	return out[start:]
 }
@@ -282,32 +359,18 @@ func (a *app) runSingleTurn(ctx context.Context, opt turnOptions, emit func(agen
 		}
 	}()
 
-	tools := a.agentTools()
-	if opt.AllowTools != nil {
-		allowed := tools[:0:0]
-		for _, t := range tools {
-			if opt.AllowTools[t.Name] {
-				allowed = append(allowed, t)
-			}
-		}
-		tools = allowed
-	}
-	schemas := make([]map[string]any, 0, len(tools))
-	schemaTokens := 0
-	for _, t := range tools {
-		schema := map[string]any{"type": "function", "function": map[string]any{"name": t.Name, "description": t.Description, "parameters": t.Parameters}}
-		schemas = append(schemas, schema)
-		encoded, _ := json.Marshal(schema)
-		schemaTokens += approxTokens(string(encoded))
-	}
-
+	tools := filterAgentTools(a.agentTools(), opt.AllowTools)
+	routeContext := recentRouteContext(s.msgs[:turnStart])
 	s.msgs = append(s.msgs, chatMsg{Role: "user", Content: opt.Text})
 
 	// The harness settles what it can without the model (see harness.go) and tidies what the model says.
 	a.ensureHarness()
 	plan := &harnessPlan{}
 	if !opt.NoHarness {
-		plan = a.harnessPlan(opt.Text, time.Now())
+		plan = a.harnessPlanWithContext(opt.Text, time.Now(), routeContext)
+	}
+	if plan.Tools != nil {
+		tools = filterAgentTools(tools, plan.Tools)
 	}
 	a.setHarnessPlan(s.key, plan)
 	if plan.Forget != "" {
@@ -315,6 +378,14 @@ func (a *app) runSingleTurn(ctx context.Context, opt turnOptions, emit func(agen
 			plan.Direct = "Done. I've forgotten that."
 		}
 	}
+	route := harnessRouteLabel(plan)
+	priorWikipedia := wikipediaMentionRE.MatchString(routeContext)
+	traceTools := toolNames(tools)
+	if plan.Direct != "" {
+		traceTools = "none"
+	}
+	a.recordCommandOutput(fmt.Sprintf("agent route session=%s route=%s prior_wikipedia=%t direct=%t tools=%s route_context_tokens=%d",
+		s.key, route, priorWikipedia, plan.Direct != "", traceTools, approxTokens(routeContext)))
 	if plan.Direct != "" {
 		s.msgs = append(s.msgs, chatMsg{Role: "assistant", Content: plan.Direct})
 		emit(agentEvent{Delta: plan.Direct})
@@ -323,14 +394,18 @@ func (a *app) runSingleTurn(ctx context.Context, opt turnOptions, emit func(agen
 	filter := newReplyFilter(opt.Spoken, plan.Wrote, emit)
 	emit = filter.Event
 	defer filter.Finish()
-	routeContext := recentRouteContext(s.msgs[:turnStart])
 	system := a.systemPrompt(time.Now())
+	schemas, schemaTokens := toolSchemasFor(tools)
 	memoryText := ""
-	if memories, err := a.searchMemory(ctx, opt.Text, 8); err == nil {
+	if memories, err := a.searchMemory(ctx, memoryRetrievalQuery(opt.Text, routeContext), 8); err == nil {
 		memoryText = formatMemoryContext(memories, 1500)
 	}
 	volatile := volatileContext(time.Now(), opt.Hint, memoryText)
-	budget := chatContext - replyTokenBudget - schemaTokens - approxTokens(system) - approxTokens(volatile) - 512
+	planNotesTokens := 0
+	if len(plan.Notes) > 0 {
+		planNotesTokens = approxTokens(strings.Join(plan.Notes, "\n")) + 64 // include the gateway section heading
+	}
+	budget := chatContext - replyTokenBudget - schemaTokens - approxTokens(system) - approxTokens(volatile+opt.Hint) - planNotesTokens - 512
 
 	stepLimit := maxAgentSteps
 	if opt.MaxSteps > 0 && opt.MaxSteps < stepLimit {
@@ -344,12 +419,26 @@ func (a *app) runSingleTurn(ctx context.Context, opt turnOptions, emit func(agen
 		messages := make([]chatMsg, 0, len(history)+1)
 		messages = append(messages, chatMsg{Role: "system", Content: system})
 		messages = append(messages, history...)
-		reply, calls, err := a.callModel(ctx, &modelGatewayCall{
+		modelCall := &modelGatewayCall{
 			Session: s.key, Step: step, UserText: opt.Text, RouteContext: routeContext,
 			Messages: messages, Tools: schemas, Spoken: opt.Spoken, emit: emit,
-		})
+		}
+		reply, calls, err := a.callModel(ctx, modelCall)
+		contextTokens := schemaTokens
+		for _, message := range modelCall.Messages {
+			contextTokens += approxTokens(message.Content)
+			for _, call := range message.ToolCalls {
+				contextTokens += approxTokens(call.Function.Name + call.Function.Arguments)
+			}
+		}
+		a.recordCommandOutput(fmt.Sprintf("agent model session=%s route=%s call=%s step=%d context_tokens=%d offered_tools=%d",
+			s.key, route, modelCall.ID, step+1, contextTokens, len(modelCall.Tools)))
 		if err != nil {
 			return err
+		}
+		// Preserve valid call/result pairs and let the model observe each action before the next.
+		if len(calls) > 1 {
+			calls = calls[:1]
 		}
 		assistant := chatMsg{Role: "assistant", Content: tidyReply(reply, opt.Spoken, filter.rules.wrote()), ToolCalls: calls}
 		s.msgs = append(s.msgs, assistant)
@@ -549,7 +638,7 @@ func (a *app) callModel(ctx context.Context, call *modelGatewayCall) (reply stri
 // streamModelCall is the transport implementation behind the gateway hooks.
 func (a *app) streamModelCall(ctx context.Context, call *modelGatewayCall, hooks []modelGatewayHook) (string, []toolCall, error) {
 	body := map[string]any{
-		"model": chatModelID, "stream": true, "messages": call.Messages,
+		"model": a.chatModelID(), "stream": true, "messages": call.Messages,
 		"max_tokens": replyTokenBudget, "temperature": 0.7, "top_p": 0.95, "top_k": 100, "min_p": 0.0, "repeat_penalty": 1.03, // the model card's instruct-mode settings
 
 	}
@@ -560,8 +649,10 @@ func (a *app) streamModelCall(ctx context.Context, call *modelGatewayCall, hooks
 		body["response_format"] = map[string]any{"type": "json_schema", "json_schema": map[string]any{"name": "result", "strict": true, "schema": call.JSONSchema}}
 		body["temperature"] = 0.2
 	}
-	// MiniCPM-V runs in instruct mode: thinking first would add seconds of silence to every answer.
-	body["chat_template_kwargs"] = map[string]any{"enable_thinking": false}
+	// MiniCPM runs in instruct mode: thinking first would add seconds of silence to every answer.
+	if strings.HasPrefix(a.chatModelID(), "minicpm") {
+		body["chat_template_kwargs"] = map[string]any{"enable_thinking": false}
+	}
 	payload, _ := json.Marshal(body)
 	request, err := http.NewRequestWithContext(ctx, http.MethodPost, chatEndpoint, bytes.NewReader(payload))
 	if err != nil {

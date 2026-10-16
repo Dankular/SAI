@@ -74,15 +74,17 @@ func setupStages() []setupStage {
 			},
 		},
 		{
-			label: "Download the assistant's brain", step: "Downloading MiniCPM-V 4.7 1B from Hugging Face",
-			failure: "downloading MiniCPM-V 4.7 1B failed", resumable: true,
+			label: "Download the assistant's brain", step: "Downloading MiniCPM5 2B from Hugging Face",
+			failure: "downloading MiniCPM5 2B failed", resumable: true,
 			run: func(a *app) error {
-				if err := a.ensureModel(chatRepo, chatFile, a.chatModel()); err != nil {
+				if err := a.ensureModel(a.selectedChatModel().Repo, a.selectedChatModel().File, a.chatModel()); err != nil {
 					return err
 				}
 				// The draft only speeds replies up, so a failed download is not a failed install.
-				if err := a.ensureModel(draftRepo, draftFile, a.draftModel()); err != nil {
-					a.recordCommandOutput("Could not download the speed-up model (continuing without it): " + err.Error())
+				if draft := a.selectedChatModel().Draft; draft != nil {
+					if err := a.ensureModel(draft.Repo, draft.File, a.draftModel()); err != nil {
+						a.recordCommandOutput("Could not download the speed-up model (continuing without it): " + err.Error())
+					}
 				}
 				return nil
 			},

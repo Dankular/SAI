@@ -17,9 +17,10 @@ import (
 // fakeModel plays the chat model: each request gets the next scripted reply, sent as the
 // server-sent events llama-server would send. It records what it was asked.
 type fakeModel struct {
-	mu       sync.Mutex
-	replies  []string // each is a list of SSE data payloads joined by newlines
-	requests []map[string]any
+	mu              sync.Mutex
+	replies         []string // each is a list of SSE data payloads joined by newlines
+	requests        []map[string]any
+	unexpectedCalls int
 }
 
 func (f *fakeModel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -28,10 +29,13 @@ func (f *fakeModel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	f.mu.Lock()
 	f.requests = append(f.requests, body)
 	n := len(f.requests) - 1
-	reply := ""
-	if n < len(f.replies) {
-		reply = f.replies[n]
+	if n >= len(f.replies) {
+		f.unexpectedCalls++
+		f.mu.Unlock()
+		http.Error(w, "unexpected scripted model call", http.StatusInternalServerError)
+		return
 	}
+	reply := f.replies[n]
 	f.mu.Unlock()
 	w.Header().Set("Content-Type", "text/event-stream")
 	for _, line := range strings.Split(reply, "\n") {
@@ -48,6 +52,36 @@ func useFakeModel(t *testing.T, replies ...string) *fakeModel {
 	chatEndpoint = server.URL + "/v1/chat/completions"
 	t.Cleanup(func() { chatEndpoint = old; server.Close() })
 	return f
+}
+
+func (f *fakeModel) assertComplete(t *testing.T) {
+	t.Helper()
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.unexpectedCalls > 0 {
+		t.Errorf("fake model received %d unexpected call(s)", f.unexpectedCalls)
+	}
+	if len(f.requests) != len(f.replies) {
+		t.Errorf("fake model consumed %d of %d scripted responses", len(f.requests), len(f.replies))
+	}
+}
+
+func TestFakeModelRejectsCallsBeyondItsScript(t *testing.T) {
+	a := newTestApp(t)
+	model := useFakeModel(t)
+	_, _, err := a.callModel(context.Background(), &modelGatewayCall{
+		Session: "script-overrun", Step: -1,
+		Messages: []chatMsg{{Role: "system", Content: "System."}, {Role: "user", Content: "Test."}},
+	})
+	if err == nil || !strings.Contains(err.Error(), "unexpected scripted model call") {
+		t.Fatalf("unexpected model call error = %v", err)
+	}
+	model.mu.Lock()
+	got := model.unexpectedCalls
+	model.mu.Unlock()
+	if got != 1 {
+		t.Fatalf("unexpected calls = %d, want 1", got)
+	}
 }
 
 func textChunk(s string) string {
@@ -68,6 +102,11 @@ func toolChunks(id, name string, argParts ...string) string {
 		lines = append(lines, `{"choices":[{"delta":{"tool_calls":[{"index":0,`+head+`}]}}]}`)
 	}
 	return strings.Join(lines, "\n")
+}
+
+func toolCallChunkAt(index int, id, name, args string) string {
+	encoded, _ := json.Marshal(args)
+	return fmt.Sprintf(`{"choices":[{"delta":{"tool_calls":[{"index":%d,"id":%q,"function":{"name":%q,"arguments":%s}}]}}]}`, index, id, name, encoded)
 }
 
 func collect(events *[]agentEvent) func(agentEvent) {
@@ -132,6 +171,124 @@ func TestAgentLoopRunsToolsThenAnswers(t *testing.T) {
 	a.agent.sessions = nil
 	if got := a.session("t"); len(got.msgs) != 4 {
 		t.Errorf("reloaded %d messages, want 4", len(got.msgs))
+	}
+}
+
+func TestAgentObservesEachToolResultBeforeTheNextAction(t *testing.T) {
+	a := newTestApp(t)
+	_ = os.MkdirAll(a.workspace, 0700)
+	_ = os.WriteFile(filepath.Join(a.workspace, "notes.txt"), []byte("the project name is Sovereign\n"), 0600)
+	model := useFakeModel(t,
+		toolCallChunkAt(0, "call_read", "read_file", `{"path":"notes.txt"}`)+"\n"+
+			toolCallChunkAt(1, "call_calc", "calculator", `{"expression":"1+1"}`),
+		toolChunks("call_calc_after_observation", "calculator", `{"expression":"1+1"}`),
+		textChunk("The notes say Sovereign, and the calculation is 2."),
+	)
+	var events []agentEvent
+	if err := a.runTurn(context.Background(), turnOptions{Session: "observe-tools", Text: "Check notes.txt and calculate 1+1"}, collect(&events)); err != nil {
+		t.Fatal(err)
+	}
+	if len(model.requests) != 3 {
+		t.Fatalf("model calls = %d, want an observation turn between the two actions", len(model.requests))
+	}
+	firstObservation := model.requests[1]["messages"].([]any)
+	var toolResults []string
+	for _, value := range firstObservation {
+		message := value.(map[string]any)
+		if message["role"] == "tool" {
+			toolResults = append(toolResults, message["content"].(string))
+		}
+	}
+	if len(toolResults) != 1 || !strings.Contains(toolResults[0], "Sovereign") {
+		t.Fatalf("second model call should observe only read_file first: %v", toolResults)
+	}
+	secondObservation := model.requests[2]["messages"].([]any)
+	toolResults = toolResults[:0]
+	for _, value := range secondObservation {
+		message := value.(map[string]any)
+		if message["role"] == "tool" {
+			toolResults = append(toolResults, message["content"].(string))
+		}
+	}
+	if len(toolResults) != 2 || !strings.Contains(toolResults[1], "1+1 = 2") {
+		t.Fatalf("third model call should observe the calculator result: %v", toolResults)
+	}
+	model.assertComplete(t)
+}
+
+func TestFitHistoryBoundsAnOversizedCurrentRequest(t *testing.T) {
+	request := strings.Repeat("start ", 5000) + "important ending"
+	got := fitHistory([]chatMsg{{Role: "user", Content: request}}, 100)
+	if len(got) != 1 {
+		t.Fatalf("history has %d messages, want current request", len(got))
+	}
+	if approxTokens(got[0].Content) > 100 {
+		t.Fatalf("current request still exceeds budget: estimated %d tokens", approxTokens(got[0].Content))
+	}
+	if !strings.HasPrefix(got[0].Content, "start") || !strings.Contains(got[0].Content, "[truncated]") || !strings.HasSuffix(got[0].Content, "important ending") {
+		t.Fatalf("oversized request should retain its beginning and ending around a marker: %q", got[0].Content)
+	}
+}
+
+func TestTurnCannotExecuteAToolExcludedByItsPlan(t *testing.T) {
+	a := newTestApp(t)
+	model := useFakeModel(t,
+		toolChunks("invented", "write_file", `{"path":"should-not-exist.txt","content":"bad"}`),
+		textChunk("I could not run that tool."),
+	)
+	ctx := context.WithValue(context.Background(), unattendedKey{}, true)
+	var events []agentEvent
+	if err := a.runTurn(ctx, turnOptions{Session: "tool-allowlist", Text: "tell me about foxes"}, collect(&events)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(a.workspace, "should-not-exist.txt")); !os.IsNotExist(err) {
+		t.Fatalf("excluded tool wrote a file; stat error = %v", err)
+	}
+	if len(model.requests) != 2 {
+		t.Fatalf("model calls = %d, want an error observation and final reply", len(model.requests))
+	}
+	var rejected bool
+	for _, value := range model.requests[1]["messages"].([]any) {
+		message := value.(map[string]any)
+		if message["role"] == "tool" && strings.Contains(message["content"].(string), "no tool called") {
+			rejected = true
+		}
+	}
+	if !rejected {
+		t.Fatal("the hidden tool call was not rejected as unavailable")
+	}
+	for _, value := range model.requests[0]["tools"].([]any) {
+		function := value.(map[string]any)["function"].(map[string]any)
+		if function["name"] == "write_file" {
+			t.Fatal("write_file was exposed for a general chat request")
+		}
+	}
+	model.assertComplete(t)
+}
+
+func TestToolSchemaBudgetUsesOnlyVisibleTools(t *testing.T) {
+	tools := []agentTool{
+		{Name: "web_search", Description: strings.Repeat("search details ", 20), Parameters: obj([]string{"query"}, map[string]any{"query": str("words")})},
+		{Name: "write_file", Description: strings.Repeat("write details ", 40), Parameters: obj([]string{"path", "content"}, map[string]any{"path": str("path"), "content": str("text")})},
+	}
+	visible := filterAgentTools(tools, map[string]bool{"web_search": true})
+	schemas, tokens := toolSchemasFor(visible)
+	if len(visible) != 1 || visible[0].Name != "web_search" || len(schemas) != 1 {
+		t.Fatalf("visible tools = %v, schemas = %v", toolNames(visible), schemas)
+	}
+	encoded, _ := json.Marshal(schemas[0])
+	want := approxTokens(string(encoded))
+	if tokens != want {
+		t.Fatalf("schema token reservation = %d, want %d for the visible schema", tokens, want)
+	}
+}
+
+func TestMemoryRetrievalQueryIncludesRecentUserContext(t *testing.T) {
+	got := memoryRetrievalQuery("Any fact, let's find one now.", "playwright\nLet's use it on Wikipedia; find me a fact.")
+	for _, want := range []string{"Current request: Any fact, let's find one now.", "Recent user requests:", "Wikipedia"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("retrieval query %q is missing %q", got, want)
+		}
 	}
 }
 

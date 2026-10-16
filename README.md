@@ -11,8 +11,8 @@ interrupt it mid-sentence.
 | Piece | What it does | Where it runs |
 |---|---|---|
 | **Agent loop** | Tool calling, skills, sessions, memory, approvals (`agent*.go`, `skills.go`, `memory.go`) | Inside the app itself; no extra process |
-| **MiniCPM-V 4.7 1B** | The language model (OpenBMB, Apache-2.0, about 1 GB) | `llama-server` on your GPU |
-| **DSpark draft** | Predicts several words ahead so replies come out faster, with identical text | Same `llama-server` (speculative decoding) |
+| **Local chat model** | MiniCPM5 2B by default; Settings can also select MiniCPM5 1B, Nanbeige4.1 3B, Qwen3.5-4B, Ministral 3 3B, Phi-4-mini, or LFM2.5-2.6B | `llama-server` on your GPU |
+| **DSpark draft** | Predicts several words ahead for faster replies when MiniCPM5 2B is selected | Same `llama-server` (speculative decoding) |
 | **EmbeddingGemma-2** | Memory search embeddings | `llama-server` (second instance) |
 | **OmniVoice** | The assistant's voice, cloned from a reference recording | `audiocpp_server` on your GPU |
 | **Smart Turn v3.2** | Decides whether a pause means you have finished speaking | Same `audiocpp_server` |
@@ -115,9 +115,11 @@ The list lives in `setup.go` (`setupStages`) and the dashboard renders whatever 
 The first stages are one-time installs and downloads (skipped on retry once they succeed); the rest start
 things and run every time. See `setup.go` for the current order. In short: workspace folders and the private
 POSIX shell, **portable Node.js and uv (so extensions can run with `npx` and `uvx`, about 50 MB, nothing
-installed system-wide)**, the llama.cpp runtime for your GPU, MiniCPM-V 4.7 1B (1.1 GB) with its DSpark
+installed system-wide)**, the llama.cpp runtime for your GPU, the default MiniCPM5 2B (2.7 GB) with its DSpark
 draft (0.2 GB), the embedding model (0.3 GB), voice and hearing (OmniVoice 1.4 GB, Smart Turn, Whistle), then
 starting the model servers, writing the persona files, indexing memory and waking the assistant.
+
+Other chat models can be selected in Settings; each is downloaded on demand and kept in your local models folder.
 
 Installs made by an earlier release fetch only what is new (the dashboard shows a small "Updating" strip).
 
@@ -249,7 +251,7 @@ shows live status, including which GPU backends were chosen.
 
 ## Licences worth knowing
 
-OmniVoice's weights are **CC-BY-NC 4.0: personal, non-commercial use only.** MiniCPM-V 4.7 and its DSpark draft, Whistle, Smart
+OmniVoice's weights are **CC-BY-NC 4.0: personal, non-commercial use only.** MiniCPM5 and its DSpark draft, Whistle, Smart
 Turn, llama.cpp, audio.cpp and onnxruntime are permissively licensed. TEN VAD is Apache-2.0 with additional
 conditions (`web/vendor/tenvad/LICENSE`). Vendored web libraries and their licences are in `web/vendor/`.
 
@@ -297,3 +299,15 @@ When a job needs something it cannot do (a service, a database, a file format), 
 
 A shipped `find-mcp-tool` skill teaches the same steps. Marketplace listings and tool output are treated as
 untrusted data.
+
+## Settings
+
+The **Settings** page (sidebar) controls the desktop widget: its width and height, whether the spiral shows and
+how big it is, and one colour for each state (asleep, awake, listening, thinking, speaking). A preview drawn by
+the same renderer the widget uses follows every change before it is saved; a new size restarts the widget, and
+everything else changes at once. "Reset" puts the standard look back.
+
+The desktop orb and the dashboard's sphere are drawn by two different programs (a CPU renderer in Go for the
+transparent desktop window, WebGL for the page), so they are kept alike by porting the web scene to Go: the same
+camera, noise, mesh, shading and layer order. They are close, not pixel-identical: colours in particular differ a
+little.

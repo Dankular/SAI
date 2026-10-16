@@ -439,6 +439,95 @@ func TestHarnessSearchesTheWebItselfForQuestionsAboutTheChangingWorld(t *testing
 	}
 }
 
+func TestHarnessAnswersAnyWikipediaFactFromRecentContext(t *testing.T) {
+	a := harnessApp(t)
+	var requested string
+	a.harness.fetch = func(ctx context.Context, address string) (string, error) {
+		requested = address
+		if !strings.Contains(address, "generator=random") {
+			return "", errors.New("unexpected Wikipedia request: " + address)
+		}
+		return `{"query":{"pages":{"42":{"title":"Honey","extract":"Honey stored in sealed containers can remain edible for thousands of years."}}}}`, nil
+	}
+	model := useFakeModel(t, textChunk("I'm well."))
+	session := a.session("wikipedia-fact")
+	session.msgs = []chatMsg{
+		{Role: "user", Content: "Let's use Playwright on Wikipedia; find me a fact."},
+		{Role: "assistant", Content: "What fact do you want?"},
+	}
+	var events []agentEvent
+	if err := a.runTurn(context.Background(), turnOptions{Session: session.key, Text: "Any fact, let's find one now."}, collect(&events)); err != nil {
+		t.Fatal(err)
+	}
+	got := replyText(events)
+	if !strings.Contains(got, "Honey stored in sealed containers can remain edible for thousands of years.") || !strings.Contains(got, "https://en.wikipedia.org/wiki/Honey") {
+		t.Fatalf("reply = %q, want a sourced Wikipedia fact", got)
+	}
+	if requested == "" || len(model.requests) != 0 {
+		t.Errorf("Wikipedia request = %q; model calls = %d, want the harness lookup and no model call", requested, len(model.requests))
+	}
+}
+
+func TestHarnessUsesConfiguredPlaywrightForWikipediaFact(t *testing.T) {
+	a := harnessApp(t)
+	configureFakeServer(t, a, "playwright")
+	a.harness.fetch = func(context.Context, string) (string, error) {
+		return "", errors.New("Wikipedia API fallback should not run when Playwright is configured")
+	}
+	plan := a.harnessPlanWithContext("Any fact, let's find one now.", harnessNow, "Let's use Playwright on Wikipedia; find me a fact.")
+	if !strings.Contains(plan.Direct, "Honey stored in sealed containers can remain edible for thousands of years.") || !strings.Contains(plan.Direct, "https://en.wikipedia.org/wiki/Special:Random") {
+		t.Fatalf("plan = %+v, want the Playwright page fact with its Wikipedia source", plan)
+	}
+}
+
+func TestDashboardPlaywrightFactFlowSurvivesSessionReload(t *testing.T) {
+	a := harnessApp(t)
+	configureFakeServer(t, a, "playwright")
+	a.harness.fetch = func(context.Context, string) (string, error) {
+		return "", errors.New("Wikipedia API fallback should not run when Playwright is configured")
+	}
+	model := useFakeModel(t, textChunk("I have a tool to run a browser: Playwright. What are you planning to do with it?"))
+	var events []agentEvent
+	if err := a.runTurn(context.Background(), turnOptions{Session: dashboardKey, Text: "playwright"}, collect(&events)); err != nil {
+		t.Fatal(err)
+	}
+	if len(model.requests) != 1 {
+		t.Fatalf("tool-identification request made %d model calls, want 1", len(model.requests))
+	}
+
+	events = nil
+	if err := a.runTurn(context.Background(), turnOptions{Session: dashboardKey, Text: "Let's use it on Wikipedia; find me a fact."}, collect(&events)); err != nil {
+		t.Fatal(err)
+	}
+	if got := replyText(events); !strings.Contains(got, "Honey stored in sealed containers can remain edible for thousands of years.") || !strings.Contains(got, "https://en.wikipedia.org/wiki/Special:Random") {
+		t.Fatalf("first fact request = %q", got)
+	}
+	if len(model.requests) != 1 {
+		t.Fatalf("fact request reached the model; calls = %d", len(model.requests))
+	}
+
+	// The dashboard session is persisted and reloaded between browser visits.
+	a.agent.sessions = nil
+	events = nil
+	if err := a.runTurn(context.Background(), turnOptions{Session: dashboardKey, Text: "Any fact, let's find one now."}, collect(&events)); err != nil {
+		t.Fatal(err)
+	}
+	if got := replyText(events); !strings.Contains(got, "Honey stored in sealed containers can remain edible for thousands of years.") || !strings.Contains(got, "https://en.wikipedia.org/wiki/Special:Random") {
+		t.Fatalf("follow-up fact request = %q", got)
+	}
+	model.assertComplete(t)
+
+	a.mu.Lock()
+	logs := strings.Join(a.state.RecentLogs, "\n")
+	a.mu.Unlock()
+	if !strings.Contains(logs, "route=wikipedia_fact") || !strings.Contains(logs, "prior_wikipedia=true") || !strings.Contains(logs, "direct=true") {
+		t.Fatalf("route trace is missing the contextual Wikipedia decision: %s", logs)
+	}
+	if strings.Contains(logs, "Any fact, let's find one now") {
+		t.Fatal("route trace retained raw user text")
+	}
+}
+
 func TestSearchFallsBackAndNeverPretendsToHaveResults(t *testing.T) {
 	a := harnessApp(t)
 	botCheck := "<html><body>Unfortunately, bots use DuckDuckGo too. Please complete the challenge.</body></html>"

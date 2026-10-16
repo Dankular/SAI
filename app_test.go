@@ -80,7 +80,7 @@ func TestPersonaTemplatesNameTheRightPeople(t *testing.T) {
 		}
 	}
 	identity := identityFile("Ada", "Sam")
-	for _, want := range []string{"You are Ada", "The person talking to you is Sam", "never you", "MiniCPM-V"} {
+	for _, want := range []string{"You are Ada", "The person talking to you is Sam", "never you", "MiniCPM5"} {
 		if !strings.Contains(identity, want) {
 			t.Errorf("IDENTITY.md is missing %q", want)
 		}

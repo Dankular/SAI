@@ -20,6 +20,7 @@ func TestHelperMCPServer(t *testing.T) {
 		return
 	}
 	reader := bufio.NewReader(os.Stdin)
+	playwrightNavigated := false
 	for {
 		line, err := reader.ReadBytes('\n')
 		if err != nil {
@@ -41,16 +42,33 @@ func TestHelperMCPServer(t *testing.T) {
 		case "initialize":
 			result = map[string]any{"protocolVersion": mcpProtocolVersion, "capabilities": map[string]any{}, "serverInfo": map[string]any{"name": "fake", "version": "1"}}
 		case "tools/list":
-			result = map[string]any{"tools": []map[string]any{
-				{"name": "convert_time", "description": "Convert a time between two time zones",
-					"inputSchema": map[string]any{"type": "object", "required": []string{"time", "from_zone", "to_zone"}, "properties": map[string]any{
-						"time": map[string]any{"type": "string"}, "from_zone": map[string]any{"type": "string"}, "to_zone": map[string]any{"type": "string"},
-						"note": map[string]any{"type": "string"}}}},
-				{"name": "ping", "description": "Check the server is alive", "inputSchema": map[string]any{"type": "object"}},
-			}}
+			if os.Getenv("GO_WANT_PLAYWRIGHT_MCP") == "1" {
+				result = map[string]any{"tools": []map[string]any{
+					{"name": "browser_navigate", "description": "Navigate to a URL", "inputSchema": map[string]any{"type": "object", "required": []string{"url"}, "properties": map[string]any{"url": map[string]any{"type": "string"}}}},
+					{"name": "browser_snapshot", "description": "Return an accessibility snapshot of the current page", "inputSchema": map[string]any{"type": "object"}},
+				}}
+			} else {
+				result = map[string]any{"tools": []map[string]any{
+					{"name": "convert_time", "description": "Convert a time between two time zones",
+						"inputSchema": map[string]any{"type": "object", "required": []string{"time", "from_zone", "to_zone"}, "properties": map[string]any{
+							"time": map[string]any{"type": "string"}, "from_zone": map[string]any{"type": "string"}, "to_zone": map[string]any{"type": "string"},
+							"note": map[string]any{"type": "string"}}}},
+					{"name": "ping", "description": "Check the server is alive", "inputSchema": map[string]any{"type": "object"}},
+				}}
+			}
 		case "tools/call":
-			args, _ := json.Marshal(req.Params.Arguments)
-			result = map[string]any{"content": []map[string]any{{"type": "text", "text": "ran " + req.Params.Name + " " + string(args)}}}
+			if os.Getenv("GO_WANT_PLAYWRIGHT_MCP") == "1" && req.Params.Name == "browser_navigate" {
+				playwrightNavigated = req.Params.Arguments["url"] == "https://en.wikipedia.org/wiki/Special:Random"
+				result = map[string]any{"content": []map[string]any{{"type": "text", "text": "Navigated to Wikipedia"}}}
+			} else if os.Getenv("GO_WANT_PLAYWRIGHT_MCP") == "1" && req.Params.Name == "browser_snapshot" && playwrightNavigated {
+				result = map[string]any{"content": []map[string]any{{"type": "text", "text": `- heading "Honey" [level=1]
+- paragraph: Honey stored in sealed containers can remain edible for thousands of years.`}}}
+			} else if os.Getenv("GO_WANT_PLAYWRIGHT_MCP") == "1" && req.Params.Name == "browser_snapshot" {
+				result = map[string]any{"content": []map[string]any{{"type": "text", "text": "No page has been opened"}}}
+			} else {
+				args, _ := json.Marshal(req.Params.Arguments)
+				result = map[string]any{"content": []map[string]any{{"type": "text", "text": "ran " + req.Params.Name + " " + string(args)}}}
+			}
 		}
 		out, _ := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": req.ID, "result": result})
 		fmt.Printf("%s\n", out)
@@ -59,8 +77,12 @@ func TestHelperMCPServer(t *testing.T) {
 
 func configureFakeServer(t *testing.T, a *app, name string) {
 	t.Helper()
+	env := map[string]string{"GO_WANT_MCP": "1"}
+	if strings.Contains(strings.ToLower(name), "playwright") {
+		env["GO_WANT_PLAYWRIGHT_MCP"] = "1"
+	}
 	cfg := mcpConfigFile{Servers: map[string]mcpServerConfig{name: {
-		Command: os.Args[0], Args: []string{"-test.run=TestHelperMCPServer"}, Env: map[string]string{"GO_WANT_MCP": "1"},
+		Command: os.Args[0], Args: []string{"-test.run=TestHelperMCPServer"}, Env: env,
 	}}}
 	if err := a.writeMCPConfig(cfg); err != nil {
 		t.Fatal(err)

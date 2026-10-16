@@ -46,6 +46,7 @@
   async function load() {
     let data;
     try { data = await (await fetch("/api/memory")).json(); } catch { return; }
+    for (const key of ["notes", "events", "jobs", "skills"]) data[key] = data[key] || []; // an empty list can arrive as null
     drawer.replaceChildren();
 
     const top = el("div", "mem-top");

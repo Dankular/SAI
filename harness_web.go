@@ -45,6 +45,102 @@ func formatResult(n int, title, link, snippet string) string {
 	return fmt.Sprintf("%d. %s\n   %s\n   %s\n", n, strings.TrimSpace(title), link, strings.TrimSpace(snippet))
 }
 
+func (a *app) wikipediaRandomFact(ctx context.Context) (string, error) {
+	if fact, used, err := a.wikipediaFactWithPlaywright(ctx); used || err != nil {
+		return fact, err
+	}
+	const endpoint = "https://en.wikipedia.org/w/api.php?action=query&generator=random&grnnamespace=0&grnlimit=1&prop=extracts&exintro=1&explaintext=1&format=json"
+	body, err := a.fetchURL(ctx, endpoint, 1<<20)
+	if err != nil {
+		return "", err
+	}
+	var response struct {
+		Query struct {
+			Pages map[string]struct {
+				Title   string `json:"title"`
+				Extract string `json:"extract"`
+			} `json:"pages"`
+		} `json:"query"`
+	}
+	if err := json.Unmarshal([]byte(body), &response); err != nil {
+		return "", fmt.Errorf("read Wikipedia response: %w", err)
+	}
+	for _, page := range response.Query.Pages {
+		title := strings.TrimSpace(page.Title)
+		extract := strings.TrimSpace(html.UnescapeString(page.Extract))
+		if title == "" || extract == "" {
+			continue
+		}
+		path := url.PathEscape(strings.ReplaceAll(title, " ", "_"))
+		return fmt.Sprintf("One fact from Wikipedia: %s Source: https://en.wikipedia.org/wiki/%s", clipText(extract, 420), path), nil
+	}
+	return "", errors.New("Wikipedia returned no readable random article")
+}
+
+func (a *app) wikipediaFactWithPlaywright(ctx context.Context) (string, bool, error) {
+	cfg, err := a.readMCPConfig()
+	if err != nil {
+		return "", false, nil
+	}
+	server := ""
+	for _, name := range sortedKeys(cfg.Servers) {
+		if strings.Contains(strings.ToLower(name), "playwright") {
+			server = name
+			break
+		}
+	}
+	if server == "" {
+		return "", false, nil
+	}
+	client, err := a.mcpClientFor(ctx, server)
+	if err != nil {
+		return "", true, fmt.Errorf("start the Playwright extension: %w", err)
+	}
+	tools, err := client.listTools(ctx)
+	if err != nil {
+		return "", true, fmt.Errorf("inspect the Playwright extension: %w", err)
+	}
+	var navigate, snapshot *mcpToolDefinition
+	for i := range tools {
+		switch tools[i].Name {
+		case "browser_navigate":
+			navigate = &tools[i]
+		case "browser_snapshot":
+			snapshot = &tools[i]
+		}
+	}
+	if navigate == nil || snapshot == nil {
+		return "", false, nil
+	}
+	if _, err := client.callTool(ctx, navigate.Name, map[string]any{"url": "https://en.wikipedia.org/wiki/Special:Random"}); err != nil {
+		return "", true, fmt.Errorf("open Wikipedia with Playwright: %w", err)
+	}
+	page, err := client.callTool(ctx, snapshot.Name, map[string]any{})
+	if err != nil {
+		return "", true, fmt.Errorf("read Wikipedia with Playwright: %w", err)
+	}
+	fact := wikipediaFactFromSnapshot(page)
+	if fact == "" {
+		return "", true, errors.New("Playwright returned no readable Wikipedia text")
+	}
+	return "One fact from Wikipedia: " + fact + " Source: https://en.wikipedia.org/wiki/Special:Random", true, nil
+}
+
+func wikipediaFactFromSnapshot(snapshot string) string {
+	text := htmlToText(snapshot)
+	for _, line := range strings.Split(text, "\n") {
+		line = strings.TrimSpace(line)
+		lower := strings.ToLower(line)
+		if i := strings.Index(lower, "paragraph:"); i >= 0 {
+			fact := strings.TrimSpace(line[i+len("paragraph:"):])
+			if fact != "" {
+				return clipText(fact, 420)
+			}
+		}
+	}
+	return clipText(strings.TrimSpace(text), 420)
+}
+
 func parseDDGResults(body string, lite bool) string {
 	var b strings.Builder
 	n := 0

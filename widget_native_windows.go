@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 	"unsafe"
@@ -91,6 +92,9 @@ type nativeOrbWindow struct {
 	lastRenderAt time.Time
 	refreshHz    int
 	audio        orbAudioEnvelope
+	fullRate     atomic.Bool // the orb is busy: draw at the full rate
+	calmEvery    atomic.Int64 // nanoseconds between frames while calm
+	freeFrames   chan []byte  // finished frames handed back for reuse
 	drag         nativeOrbDrag
 	stop         chan struct{}
 	stopOnce     sync.Once
@@ -212,7 +216,7 @@ func (r *nativeWidgetRenderer) start(a *app, x, y, width, height int) (*exec.Cmd
 	r.mu.Unlock()
 	w := &nativeOrbWindow{
 		app: a, renderer: r, width: width, height: height,
-		startedAt: time.Now(), stop: make(chan struct{}), done: make(chan struct{}),
+		startedAt: time.Now(), stop: make(chan struct{}), done: make(chan struct{}), freeFrames: make(chan []byte, 6),
 	}
 	ready := make(chan error, 1)
 	go w.run(x, y, ready)
@@ -330,16 +334,16 @@ func (w *nativeOrbWindow) run(x, y int, ready chan<- error) {
 		<-producerDone
 	}()
 
-	frameTick := time.NewTimer(nativeFrameInterval(w.refreshHz))
+	frameTick := time.NewTimer(w.presentInterval())
 	defer frameTick.Stop()
 	refreshCheck := time.NewTicker(time.Second)
 	defer refreshCheck.Stop()
-	frameInterval := nativeFrameInterval(w.refreshHz)
+	frameInterval := w.presentInterval()
 	nextPresentation := time.Now().Add(frameInterval)
 	previousFrame, currentFrame := initialFrame, initialFrame
 	for {
 		w.dispatchMessages()
-		if next := nativeFrameInterval(w.refreshHz); next != frameInterval {
+		if next := w.presentInterval(); next != frameInterval {
 			if !frameTick.Stop() {
 				select {
 				case <-frameTick.C:
@@ -358,7 +362,11 @@ func (w *nativeOrbWindow) run(x, y int, ready chan<- error) {
 				for {
 					select {
 					case frame := <-frameUpdates:
+						old := previousFrame
 						previousFrame, currentFrame = currentFrame, frame
+						if len(old.pixels) > 0 && &old.pixels[0] != &previousFrame.pixels[0] {
+							w.releaseFrame(old.pixels) // nothing refers to it any more
+						}
 					default:
 						goto framesCollected
 					}
@@ -389,8 +397,17 @@ func (w *nativeOrbWindow) run(x, y int, ready chan<- error) {
 // the display's reported refresh rate, so expensive scene rendering does not have to finish every
 // 6–8 ms on high-refresh displays.
 func (w *nativeOrbWindow) produceFrames(out chan<- nativeRenderedOrbFrame) {
-	const renderInterval = time.Second / 60
-	nextRender := w.lastRenderAt.Add(renderInterval)
+	const busyInterval = time.Second / 60
+	interval := func() time.Duration {
+		if w.fullRate.Load() {
+			return busyInterval
+		}
+		if calm := time.Duration(w.calmEvery.Load()); calm > 0 {
+			return calm
+		}
+		return orbCalmInterval(false)
+	}
+	nextRender := w.lastRenderAt.Add(interval())
 	for {
 		if wait := time.Until(nextRender); wait > 0 {
 			timer := time.NewTimer(wait)
@@ -407,11 +424,21 @@ func (w *nativeOrbWindow) produceFrames(out chan<- nativeRenderedOrbFrame) {
 		case <-w.stop:
 			return
 		}
-		nextRender = nextRender.Add(renderInterval)
+		nextRender = nextRender.Add(interval())
 		if now := time.Now(); !nextRender.After(now) {
 			nextRender = now
 		}
 	}
+}
+
+// presentInterval is how often the window is updated. Each update blends two full frames and hands the
+// result to the desktop compositor, so it is not done at a high monitor's full refresh rate: 60 a second
+// while the orb is busy, 30 while it is calm.
+func (w *nativeOrbWindow) presentInterval() time.Duration {
+	if w.fullRate.Load() {
+		return max(nativeFrameInterval(w.refreshHz), time.Second/60)
+	}
+	return time.Second / 30
 }
 
 func nativeFrameInterval(refreshHz int) time.Duration {
@@ -501,9 +528,37 @@ func (w *nativeOrbWindow) renderFrame(now time.Time) nativeRenderedOrbFrame {
 	}
 	w.lastRenderAt = now
 	w.audio.update(&inputs, delta)
+	busy := orbWantsFullRate(inputs)
+	w.fullRate.Store(busy)
+	inputs.Workers = orbWorkersFor(busy, !inputs.Style.NoSpiral)
+	w.calmEvery.Store(int64(orbCalmInterval(!inputs.Style.NoSpiral)))
 	return nativeRenderedOrbFrame{
-		pixels: renderOrbFrameWithInputs(w.width, w.height, inputs, now.Sub(w.startedAt).Seconds()),
+		pixels: renderOrbFrameInto(w.takeFrame(), w.width, w.height, inputs, now.Sub(w.startedAt).Seconds()),
 		at:     now,
+	}
+}
+
+// takeFrame returns a buffer for the next frame: a recycled one if there is one. At 60 frames a second a
+// fresh 1.4 MB buffer each time is a lot of garbage for the collector to chase.
+func (w *nativeOrbWindow) takeFrame() []byte {
+	size := w.width * w.height * 4
+	select {
+	case buf := <-w.freeFrames:
+		if len(buf) == size {
+			return buf
+		}
+	default:
+	}
+	return make([]byte, size)
+}
+
+func (w *nativeOrbWindow) releaseFrame(buf []byte) {
+	if len(buf) == 0 {
+		return
+	}
+	select {
+	case w.freeFrames <- buf:
+	default: // enough spares already
 	}
 }
 
@@ -536,11 +591,22 @@ func blendNativeOrbFrames(destination, from, to []byte, amount float64) {
 		copy(destination, to)
 		return
 	}
-	weight := uint32(amount * 65536)
-	inverse := uint32(65536) - weight
-	for i := range destination {
-		value := uint32(from[i])*inverse + uint32(to[i])*weight
-		destination[i] = byte((value + 32768) >> 16)
+	pixels := len(destination) / 4
+	if pixels == 0 {
+		return
+	}
+	// One 32-bit operation per pixel: red and blue are blended together in one pair of 16-bit lanes, alpha
+	// and green in another, with an 8-bit weight.
+	weight := uint32(amount*256 + 0.5)
+	inverse := 256 - weight
+	d := unsafe.Slice((*uint32)(unsafe.Pointer(&destination[0])), pixels)
+	f := unsafe.Slice((*uint32)(unsafe.Pointer(&from[0])), pixels)
+	t := unsafe.Slice((*uint32)(unsafe.Pointer(&to[0])), pixels)
+	const lanes, round = 0x00FF00FF, 0x00800080
+	for i := range d {
+		rb := (((f[i]&lanes)*inverse + (t[i]&lanes)*weight + round) >> 8) & lanes
+		ag := (((f[i]>>8)&lanes)*inverse + ((t[i]>>8)&lanes)*weight + round) & 0xFF00FF00
+		d[i] = rb | ag
 	}
 }
 
@@ -608,6 +674,10 @@ func (a *app) orbRenderInputs() orbFrameInputs {
 		inputs.Level, inputs.Bass, inputs.Mid, inputs.Treble = snapshot.Level, snapshot.Bass, snapshot.Mid, snapshot.Treble
 	}
 	inputs.StimulusAgeMs, inputs.FlashAgeMs = snapshot.StimulusAgeMs, snapshot.FlashAgeMs
+	a.mu.Lock()
+	inputs.Style = styleFromSnapshot(a.state)
+	a.mu.Unlock()
+	inputs.PixelRatio = float64(systemDPI()) / 96
 	return inputs
 }
 

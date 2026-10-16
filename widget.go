@@ -56,15 +56,12 @@ func widgetBrowser() (string, error) {
 // widgetLayout returns the pixel position and size for the saved corner and size.
 func (a *app) widgetLayout() (x, y, w, h int) {
 	a.mu.Lock()
-	corner, size := a.state.WidgetCorner, a.state.WidgetSize
+	corner := a.state.WidgetCorner
 	positionSet, positionX, positionY := a.state.WidgetPositionSet, a.state.WidgetPositionX, a.state.WidgetPositionY
+	logicalW, logicalH := widgetLogicalSize(a.state)
 	a.mu.Unlock()
-	dims, ok := widgetSizes[size]
-	if !ok {
-		dims = widgetSizes["medium"]
-	}
 	scale := float64(systemDPI()) / 96
-	w, h = int(float64(dims[0])*scale), int(float64(dims[1])*scale)
+	w, h = int(float64(logicalW)*scale), int(float64(logicalH)*scale)
 	margin := int(24 * scale)
 	ax, ay, aw, ah := workArea()
 	if positionSet {
