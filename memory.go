@@ -605,11 +605,14 @@ func (a *app) searchMemory(ctx context.Context, query string, k int) ([]memChunk
 					score += 0.10
 				case "candidate":
 					score -= 0.08
+				case "stale":
+					score -= 0.15
 				}
 				if parsed, parseErr := time.Parse(time.RFC3339, result.Metadata["created_at"]); parseErr == nil {
 					ageDays := time.Since(parsed).Hours() / 24
 					score += 0.04 * math.Exp(-math.Max(0, ageDays)/365)
 				}
+				score += salienceBoost(a.memoryUseOf(result.Metadata["source_id"]), time.Now())
 				ranked = append(ranked, memChunk{
 					File: result.Metadata["source"], Text: result.Content, SourceID: result.Metadata["source_id"],
 					GroupID: result.Metadata["group_id"], Kind: result.Metadata["kind"], Scope: result.Metadata["scope"],

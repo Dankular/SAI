@@ -30,6 +30,12 @@ func installPieces() []installPiece {
 			optional: true,
 		},
 		{
+			label:    "npx and uvx for extensions",
+			present:  func(a *app) bool { return a.toolchainReady() },
+			fetch:    func(a *app) error { return a.ensureToolchain() },
+			optional: true,
+		},
+		{
 			label:   "the language-model engine",
 			present: func(a *app) bool { _, ok := findFile(a.llamaRoot(), "llama-server.exe"); return ok },
 			fetch: func(a *app) error {
@@ -125,11 +131,16 @@ func (a *app) repairInstall() {
 // legacyPaths are left behind by releases that used OpenClaw and a private Node.js.
 func (a *app) legacyPaths() []string {
 	rt := a.runtimeDir()
-	return []string{
+	paths := []string{
 		filepath.Join(rt, "node"), filepath.Join(rt, "openclaw"), filepath.Join(rt, "home"), filepath.Join(rt, "npm-cache"),
 		filepath.Join(a.dataDir, "gateway.log"), filepath.Join(a.dataDir, "gateway.token"),
-		filepath.Join(a.modelsDir(), "Agents-A1-4B-Q4_K_M.gguf"),
 	}
+	// the old chat model (Agents-A1) in any quantisation, and any half-finished download of it
+	for _, pattern := range legacyModelGlobs {
+		matches, _ := filepath.Glob(filepath.Join(a.modelsDir(), pattern))
+		paths = append(paths, matches...)
+	}
+	return paths
 }
 
 // removeLegacy deletes what this release no longer uses. The old chat model is only removed
@@ -137,8 +148,8 @@ func (a *app) legacyPaths() []string {
 func (a *app) removeLegacy() {
 	var freed int64
 	for _, path := range a.legacyPaths() {
-		if strings.HasSuffix(path, ".gguf") && !isFile(a.chatModel()) {
-			continue
+		if strings.Contains(filepath.Base(path), "Agents-A1") && !isFile(a.chatModel()) {
+			continue // the old model stays until its replacement is in place
 		}
 		freed += treeSize(path)
 		_ = os.RemoveAll(path)

@@ -27,6 +27,9 @@ type agentTool struct {
 	Parameters  map[string]any
 	Guard       func(a *app, args map[string]any) string
 	Run         func(ctx context.Context, a *app, args map[string]any) (string, error)
+	// Terminal tools finish the turn: their result is the reply, so the small model cannot ramble
+	// or contradict it afterwards. A failed or refused call still goes back to the model.
+	Terminal bool
 }
 
 func obj(required []string, props map[string]any) map[string]any {
@@ -65,7 +68,7 @@ func (a *app) agentTools() []agentTool {
 			return ""
 		}
 	}
-	return []agentTool{
+	tools := []agentTool{
 		{
 			Name:        "shell",
 			Description: "Run a POSIX shell command in the private workspace userland. The user approves each command.",
@@ -97,9 +100,11 @@ func (a *app) agentTools() []agentTool {
 		},
 		{
 			Name:        "extension",
-			Description: "Discover MCP servers, then configure and call selected tools.",
+			Description: "Extend yourself with MCP tools. find: check installed tools, then the marketplace, for a job (query). install a found server (url). use a tool for a goal (server, tool, goal).",
 			Parameters: obj([]string{"action"}, map[string]any{
-				"action":            map[string]any{"type": "string", "enum": []string{"discover", "inspect", "list", "configure", "search", "describe", "call", "remove"}, "description": "What to do"},
+				"action":            map[string]any{"type": "string", "enum": []string{"find", "install", "use", "discover", "inspect", "list", "configure", "search", "describe", "call", "remove"}, "description": "What to do"},
+				"goal":              str("use: what you want done, in plain words"),
+				"context":           str("use: facts the tool needs, such as names or addresses the user gave"),
 				"server":            str("Extension server name"),
 				"command":           str("Program to launch for a server"),
 				"args":              map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "Program arguments"},
@@ -112,6 +117,10 @@ func (a *app) agentTools() []agentTool {
 			}),
 			Guard: func(a *app, args map[string]any) string {
 				switch argString(args, "action") {
+				case "install":
+					return "Install and start the MCP server from " + clipText(argString(args, "url"), 200)
+				case "use":
+					return "Use MCP tool " + argString(args, "server") + "." + argString(args, "tool") + " to: " + clipText(argString(args, "goal"), 200)
 				case "configure":
 					return "Configure MCP server " + argString(args, "server") + " to run " + clipText(argString(args, "command"), 180)
 				case "remove":
@@ -205,12 +214,6 @@ func (a *app) agentTools() []agentTool {
 			Run:         toolWebFetch,
 		},
 		{
-			Name:        "memory_search",
-			Description: "Look up what you already know: anything the user told you before, their notes, plans, people and past conversations. Use this FIRST for any question about the user's own life or about something said earlier.",
-			Parameters:  obj([]string{"query"}, map[string]any{"query": str("What to look for")}),
-			Run:         toolMemorySearch,
-		},
-		{
 			Name:        "remember",
 			Description: "Save a NEW lasting fact, only when the user asks you to remember something or tells you a new fact about themselves. Never use it to answer a question. File \"user\" is for facts about the person, \"memory\" for everything else. One short sentence.",
 			Parameters:  obj([]string{"text"}, map[string]any{"text": str("The fact to keep"), "file": map[string]any{"type": "string", "enum": []string{"user", "memory"}, "description": "Where to keep it"}}),
@@ -223,6 +226,7 @@ func (a *app) agentTools() []agentTool {
 			Run:         toolReadSkill,
 		},
 	}
+	return append(append(tools, memoryToolDefs()...), scheduleToolDef())
 }
 
 // --- paths -------------------------------------------------------------------
@@ -551,21 +555,6 @@ func toolWebSearch(ctx context.Context, a *app, args map[string]any) (string, er
 }
 
 // --- memory and skills -------------------------------------------------------
-
-func toolMemorySearch(ctx context.Context, a *app, args map[string]any) (string, error) {
-	hits, err := a.searchMemory(ctx, argString(args, "query"), 5)
-	if err != nil {
-		return "", err
-	}
-	if len(hits) == 0 {
-		return "Nothing relevant is in memory.", nil
-	}
-	var b strings.Builder
-	for _, h := range hits {
-		fmt.Fprintf(&b, "[%s | %s | %s | %s | rank %.3f] %s\n%s\n\n", h.Kind, h.Scope, h.Status, h.SourceID, h.Score, h.File, h.Text)
-	}
-	return b.String(), nil
-}
 
 func toolRemember(ctx context.Context, a *app, args map[string]any) (string, error) {
 	text := mdLine(argString(args, "text"))

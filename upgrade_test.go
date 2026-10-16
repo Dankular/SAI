@@ -78,9 +78,11 @@ func TestMissingPiecesNamesOnlyWhatIsAbsent(t *testing.T) {
 		names = append(names, p.label)
 	}
 	got := strings.Join(names, ",")
-	if got != "the language model,the speed-up model" {
+	if got != "npx and uvx for extensions,the language model,the speed-up model" {
 		t.Errorf("missing = %q", got)
 	}
+	useFakeToolchain(t, false)
+	fakeInstalledToolchain(t, a)
 	touch(t, a.chatModel(), 5)
 	touch(t, a.draftModel(), 5)
 	if left := a.missingPieces(); len(left) != 0 {

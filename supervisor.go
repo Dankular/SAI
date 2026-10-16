@@ -1,6 +1,7 @@
 package main
 
 import (
+	"path/filepath"
 	"fmt"
 	"os"
 	"os/exec"
@@ -409,10 +410,12 @@ func (s *supervisor) stopService(svc *managedService, reason string) {
 	s.wake()
 }
 
-// evictOrphans stops anything still listening on our fixed ports from an earlier run of the
-// app (a crash or forced close leaves child processes behind, and a leftover model server
-// would hold the port so a new one refuses to start). Call before anything is started.
-func evictOrphans(ports []int, logf func(string)) {
+// evictOrphans stops leftover model servers from an earlier run of this install (a crash or forced
+// close leaves child processes behind, and a leftover server would hold the port so a new one refuses to
+// start). It only ever stops a process whose program lives inside root, this install's own runtime
+// folder. Anything else holding a port (another copy of the app with its own data folder, or an unrelated
+// program) is left alone and reported. Call before anything is started.
+func evictOrphans(ports []int, root string, logf func(string)) {
 	if runtime.GOOS != "windows" {
 		return
 	}
@@ -420,25 +423,56 @@ func evictOrphans(ports []int, logf func(string)) {
 	if err != nil {
 		return
 	}
-	wanted := map[string]bool{}
-	for _, p := range ports {
-		wanted[":"+strconv.Itoa(p)] = true
-	}
 	killed := map[int]bool{}
-	for _, line := range strings.Split(string(output), "\n") {
-		fields := strings.Fields(line)
-		if len(fields) < 5 || fields[3] != "LISTENING" || !strings.HasPrefix(fields[1], "127.0.0.1") {
+	for _, owner := range listeningOwners(string(output), ports) {
+		if owner.pid == os.Getpid() || killed[owner.pid] {
 			continue
 		}
-		local := fields[1][strings.LastIndex(fields[1], ":"):]
-		pid, err := strconv.Atoi(fields[4])
-		if !wanted[local] || err != nil || pid == os.Getpid() || killed[pid] {
+		image := processImagePath(owner.pid)
+		if !pathInside(root, image) {
+			what := "a program we could not identify"
+			if image != "" {
+				what = image
+			}
+			logf(fmt.Sprintf("Port %d is in use by %s, which is not part of this install, so it was left running", owner.port, what))
 			continue
 		}
-		killed[pid] = true
-		_ = exec.Command("taskkill.exe", "/PID", fmt.Sprint(pid), "/T", "/F").Run()
-		logf(fmt.Sprintf("Stopped a leftover process from an earlier run (port %s)", local[1:]))
+		killed[owner.pid] = true
+		_ = exec.Command("taskkill.exe", "/PID", fmt.Sprint(owner.pid), "/T", "/F").Run()
+		logf(fmt.Sprintf("Stopped a leftover process from an earlier run (port %d)", owner.port))
 	}
+}
+
+type portOwner struct{ port, pid int }
+
+// listeningOwners reads `netstat -ano -p tcp` output and returns who listens on the wanted loopback ports.
+func listeningOwners(netstat string, ports []int) []portOwner {
+	wanted := map[int]bool{}
+	for _, p := range ports {
+		wanted[p] = true
+	}
+	var owners []portOwner
+	for _, line := range strings.Split(netstat, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 5 || fields[3] != "LISTENING" || !strings.HasPrefix(fields[1], "127.0.0.1:") {
+			continue
+		}
+		port, portErr := strconv.Atoi(fields[1][strings.LastIndex(fields[1], ":")+1:])
+		pid, pidErr := strconv.Atoi(fields[4])
+		if portErr == nil && pidErr == nil && wanted[port] {
+			owners = append(owners, portOwner{port: port, pid: pid})
+		}
+	}
+	return owners
+}
+
+// pathInside reports whether path is root or lies under it. An empty path is never inside.
+func pathInside(root, path string) bool {
+	if root == "" || path == "" {
+		return false
+	}
+	rel, err := filepath.Rel(strings.ToLower(filepath.Clean(root)), strings.ToLower(filepath.Clean(path)))
+	return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) && !filepath.IsAbs(rel)
 }
 
 // ---- the app's services ----------------------------------------------------

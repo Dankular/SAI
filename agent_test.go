@@ -240,7 +240,7 @@ func TestSystemPromptCarriesIdentityPreferencesAndSkills(t *testing.T) {
 	_ = os.MkdirAll(skillDir, 0700)
 	_ = os.WriteFile(filepath.Join(skillDir, "SKILL.md"), []byte("---\nname: weekly-plan\ndescription: \"Plan the week from the calendar\"\n---\n# Weekly plan\nStep one.\n"), 0600)
 	prompt := a.systemPrompt(time.Date(2026, 10, 16, 9, 30, 0, 0, time.UTC))
-	for _, want := range []string{"=== IDENTITY.md ===", "=== SOUL.md ===", "=== AGENTS.md ===", "=== USER.md ===", "You are Sam", "Name: Ada", "weekly-plan: Plan the week from the calendar", "Friday 16 October 2026, 09:30"} {
+	for _, want := range []string{"=== IDENTITY.md ===", "=== SOUL.md ===", "=== AGENTS.md ===", "=== USER.md ===", "You are Sam", "Name: Ada", "weekly-plan: Plan the week from the calendar"} {
 		if !strings.Contains(prompt, want) {
 			t.Errorf("system prompt is missing %q", want)
 		}

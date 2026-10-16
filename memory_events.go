@@ -151,6 +151,8 @@ func (a *app) collectEventSources(out *[]brainSource) error {
 		status := event.Status
 		if superseded[event.ID] {
 			status = "superseded"
+		} else if event.Event == "task_unfinished" && staleEvent(event, time.Now()) && !a.memoryUseOf("event:"+event.ID).Pinned {
+			status = "stale" // an open task nobody mentioned for two months
 		}
 		text := eventText(event)
 		for _, relatedID := range event.RelatedIDs {
@@ -198,6 +200,9 @@ func (a *app) observeConversationTurn(ctx context.Context, session string, messa
 		if statErr == nil {
 			if err := a.extractMemoryEvents(ctx, session, messages, turnStart); err != nil {
 				a.recordCommandOutput("Memory event extraction was skipped: " + err.Error())
+			}
+			if turnStart >= 0 && turnStart < len(messages) {
+				a.proposeSkill(ctx, session, messages[turnStart:])
 			}
 		} else if !os.IsNotExist(statErr) {
 			a.recordCommandOutput("Memory event extraction was skipped: " + statErr.Error())
@@ -272,6 +277,7 @@ When a task finishes, consolidate its relevant prior attempts into one problem_r
 	reply, _, err := a.callModel(modelCtx, &modelGatewayCall{
 		Session: "memory-extraction", Step: -1, UserText: string(encoded),
 		Messages: []chatMsg{{Role: "system", Content: prompt}, {Role: "user", Content: string(encoded)}},
+		JSONSchema: memoryEventsSchema(),
 		emit:     func(agentEvent) {},
 	})
 	if err != nil {
@@ -322,8 +328,22 @@ func (a *app) appendExtractedEvents(session string, observed []observedMessage, 
 		for _, ref := range candidate.Evidence {
 			message, ok := byIndex[ref.Message]
 			quote := strings.TrimSpace(ref.Quote)
-			if !ok || quote == "" || !containsNormalized(message.Content, quote) {
+			if quote == "" {
 				continue
+			}
+			if !ok || !containsNormalized(message.Content, quote) {
+				// A small model often quotes correctly but numbers the message wrong. If the quote
+				// is found in exactly one observed message, that message is the evidence.
+				found, matches := observedMessage{}, 0
+				for _, candidate := range observed {
+					if containsNormalized(candidate.Content, quote) {
+						found, matches = candidate, matches+1
+					}
+				}
+				if matches != 1 {
+					continue
+				}
+				message, ref.Message = found, found.Index
 			}
 			evidence = append(evidence, memoryEventEvidence{
 				SourceID: fmt.Sprintf("session:%s:message:%d", session, ref.Message), Role: message.Role,
@@ -343,6 +363,7 @@ func (a *app) appendExtractedEvents(session string, observed []observedMessage, 
 				continue
 			}
 		}
+		candidate = reconcileEventType(candidate, verifiedMessages)
 		status := memoryEventStatus(candidate.Event, verifiedMessages)
 		scope := cleanField(candidate.Scope, 120)
 		if scope == "" || (scope != "user" && !strings.HasPrefix(scope, "project:")) {
@@ -546,4 +567,9 @@ func (a *app) deleteSessionMemory(session string) {
 	}
 	a.agent.eventsMu.Unlock()
 	a.memoryDirty()
+}
+
+func staleEvent(event memoryEventRecord, now time.Time) bool {
+	created, err := time.Parse(time.RFC3339, event.CreatedAt)
+	return err == nil && now.Sub(created) > staleTaskAge
 }

@@ -138,6 +138,28 @@ func (a *app) harnessPlan(text string, now time.Time) *harnessPlan {
 			return plan
 		}
 	}
+	if reply, ok := a.scheduleRecurringTask(text); ok {
+		plan.Direct = reply
+		return plan
+	}
+	if reply, ok := a.scheduleFromSentence(text); ok {
+		plan.Direct = reply
+		plan.Wrote = false
+		return plan
+	}
+	if reply, ok := a.correctFact(text); ok {
+		plan.Direct = reply
+		plan.Wrote = true
+		return plan
+	}
+	if listRemindersRE.MatchString(text) {
+		plan.Direct = a.describeSchedule()
+		return plan
+	}
+	if reply, ok := a.scheduleReminder(text); ok {
+		plan.Direct = reply
+		return plan
+	}
 	if timeRE.MatchString(text) {
 		plan.Direct = fmt.Sprintf("It's %s.", now.Format("15:04 on Monday 2 January"))
 		return plan
@@ -158,6 +180,10 @@ func (a *app) harnessPlan(text string, now time.Time) *harnessPlan {
 	}
 
 	// A question the notes can answer is a lookup, not a language task.
+	if answer, ok := a.previousValue(text); ok {
+		plan.Direct = answer
+		return plan
+	}
 	if answer, ok := a.recallAnswer(text); ok {
 		plan.Direct = answer
 		return plan
@@ -179,13 +205,14 @@ func (a *app) harnessPlan(text string, now time.Time) *harnessPlan {
 		plan.Wrote = true
 		plan.Notes = append(plan.Notes, "You have already saved this to the user's notes: "+strings.Join(saved, "; ")+". Acknowledge it in one short sentence, in your own words"+addressing(name)+". Do not call any tool for it.")
 	}
-	if webLookupRE.MatchString(text) || weatherRE.MatchString(text) {
+	scheduling := scheduleWordsRE.MatchString(text)
+	if !scheduling && (webLookupRE.MatchString(text) || weatherRE.MatchString(text)) {
 		if reply, ok := a.weatherNow(context.Background(), text); ok {
 			plan.Direct = reply
 			return plan
 		}
 	}
-	if webLookupRE.MatchString(text) && strings.Contains(text, " ") {
+	if !scheduling && webLookupRE.MatchString(text) && strings.Contains(text, " ") {
 		if results := a.prefetchWeb(text); results == "" {
 			plan.Notes = append(plan.Notes, "The harness tried to look this up on the web and could not. Tell the user you could not check it right now. Do not guess or answer from memory.")
 		} else {
@@ -283,6 +310,8 @@ var (
 	fileWordsRE   = regexp.MustCompile(`(?i)\b(file|files|folder|directory|document|read|write|edit|create|rename|open|workspace|patch|\.txt|\.md|\.json|\.go|\.py|\.js)\b|\.\w{1,4}\b`)
 	shellWordsRE  = regexp.MustCompile(`(?i)\b(shell|command|run|terminal|bash|powershell|script|install|git|npm|pip|compile|build|process|server|ping|grep)\b`)
 	webWordsRE    = regexp.MustCompile(`(?i)\b(search|web|google|look up|lookup|online|internet|latest|newest|news|weather|website|http|https|url|price|stock|score|release|version|who is|who was|when did|wikipedia)\b`)
+	memoryEditWordsRE = regexp.MustCompile(`(?i)\b(pin|unpin|correct(?:ion)?|update (?:my|that|the)|change (?:my|that|the)|no longer|not anymore|actually,? (?:i|my)|keep (?:that|this) in mind)\b`)
+	scheduleWordsRE = regexp.MustCompile(`(?i)\b(remind|reminders?|schedule[ds]?|alarm|timer|every (?:day|week|hour|morning|evening|\d+ )|daily|hourly|recurring|cron|scheduled)\b`)
 	memoryWordsRE = regexp.MustCompile(`(?i)\b(remember|recall|my|did i|told you|notes?|earlier|last time|before|yesterday|appointment|password|where did|when is|what was)\b`)
 )
 
@@ -302,7 +331,13 @@ func toolsFor(text string) map[string]bool {
 		tools["web_search"], tools["web_fetch"] = true, true
 	}
 	if memoryWordsRE.MatchString(text) {
-		tools["memory_search"] = true
+		tools["memory_search"], tools["memory_get"] = true, true
+	}
+	if scheduleWordsRE.MatchString(text) {
+		tools["schedule"] = true
+	}
+	if memoryEditWordsRE.MatchString(text) {
+		tools["memory_search"], tools["memory_get"], tools["memory_edit"] = true, true, true
 	}
 	if strings.Contains(strings.ToLower(text), "skill") {
 		tools["read_skill"] = true
@@ -388,6 +423,7 @@ func (a *app) saveFact(file, note string) string {
 				lines[i] = line
 				if os.WriteFile(path, []byte(strings.Join(lines, "\n")), 0600) == nil {
 					a.memoryDirty()
+					a.recordFactChange(body, note)
 					return "updated"
 				}
 			}

@@ -45,7 +45,10 @@ type modelGatewayCall struct {
 	Messages     []chatMsg
 	Tools        []map[string]any
 	Spoken       bool
-	emit         func(agentEvent)
+	// JSONSchema, when set on a call with no tools, makes llama-server decode only text that fits
+	// the schema. It is never combined with tools: constraining output can suppress tool calls.
+	JSONSchema map[string]any
+	emit       func(agentEvent)
 }
 
 type modelGatewayStreamEvent struct {
@@ -106,7 +109,9 @@ func (a *app) modelGatewayHooks() []modelGatewayHook {
 }
 
 func (a *app) marketplacePreflight(ctx context.Context, call *modelGatewayCall) error {
-	return a.marketplacePreflightWith(ctx, call, a.discoverMCPServers)
+	return a.marketplacePreflightWith(ctx, call, func(ctx context.Context, query string) (string, error) {
+		return a.findMCPTool(ctx, query, false)
+	})
 }
 
 func (a *app) marketplacePreflightWith(ctx context.Context, call *modelGatewayCall, discover func(context.Context, string) (string, error)) error {

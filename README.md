@@ -112,18 +112,14 @@ shows each stage. If something fails, the retry button resumes from the first un
 ### Setup stages
 
 The list lives in `setup.go` (`setupStages`) and the dashboard renders whatever the server sends.
-Stages 1-5 are one-time installs and downloads (skipped on retry once they succeed); 6-9 start things
-and run every time.
+The first stages are one-time installs and downloads (skipped on retry once they succeed); the rest start
+things and run every time. See `setup.go` for the current order. In short: workspace folders and the private
+POSIX shell, **portable Node.js and uv (so extensions can run with `npx` and `uvx`, about 50 MB, nothing
+installed system-wide)**, the llama.cpp runtime for your GPU, MiniCPM-V 4.7 1B (1.1 GB) with its DSpark
+draft (0.2 GB), the embedding model (0.3 GB), voice and hearing (OmniVoice 1.4 GB, Smart Turn, Whistle), then
+starting the model servers, writing the persona files, indexing memory and waking the assistant.
 
-1. Workspace folders (`memory\`, `skills\`)
-2. llama.cpp runtime for your GPU
-3. MiniCPM-V 4.7 1B (1.1 GB) and its DSpark draft (0.2 GB)
-4. Embedding model (0.3 GB)
-5. Voice and hearing: speech runtime, OmniVoice (1.4 GB), Smart Turn, Whistle (18 MB)
-6. Start the model servers and the voice
-7. Write the persona files
-8. Index memory
-9. Wake the assistant
+Installs made by an earlier release fetch only what is new (the dashboard shows a small "Updating" strip).
 
 To re-run from a stage: `POST /api/install?from=N`.
 
@@ -163,8 +159,9 @@ The pre-call route check uses the local Hugging Face EmbeddingGemma model with i
 and a compact sample of recent user context. Only a confident missing-capability route triggers a read-only
 marketplace search; installing or configuring a result still follows the normal approval rules.
 
-**Tools** the model can call: `shell`, `read_file`, `write_file`, `edit_file`, `list_dir`, `web_search`,
-`web_fetch`, `memory_search`, `remember`, `read_skill`.
+**Tools** the model can call: `shell`, `process`, `read_file`, `write_file`, `edit_file`, `apply_patch`,
+`list_dir`, `calculator`, `web_search`, `web_fetch`, `memory_search`, `memory_get`, `memory_edit`, `remember`,
+`schedule`, `read_skill` and `extension`. The harness offers only the few that fit each message.
 
 **Approvals.** Running a command, and reading or writing outside the workspace folder, always pauses and asks
 you to **Allow** or **Don't allow** in the conversation. Web tools can never reach this computer or your local
@@ -265,3 +262,38 @@ go build -buildvcs=false -o dist\SovereignAI.exe .
 ```
 
 `AGENTS.md` describes the code layout and conventions.
+
+## Adaptive memory
+
+Everything below is plain files plus code you can read; nothing is sent anywhere.
+
+- **Corrections keep history.** "Actually my gym day is Thursday" replaces the note and keeps the old value, so
+  "what was my gym day before?" has an answer.
+- **It learns what matters.** Memories it actually uses rank higher and fade over time; pinned ones stay.
+  Notes over their prompt budget move to `memoryrchive.md` (still searchable) instead of being cut off.
+- **It tidies itself.** A daily pass merges duplicate and outdated notes (backed up first to `brainackups`).
+  Once a day while idle it also *reflects*: the model proposes tidy-ups and the program applies only those it can
+  ground in recorded events, logging them in `memory\dreams.md`.
+- **A profile it can show its work for.** What it has learned about you comes from events with the quote that
+  produced them. The **Memory** drawer in the dashboard lets you read, pin, correct and forget any of it.
+- **Reminders and routines.** "Remind me to call mum tomorrow at 9", "check the weather every morning at 7".
+  Unattended tasks get lookup-and-read tools only and a step cap. `HEARTBEAT.md` holds an optional checklist it
+  runs every 30 minutes while idle (`every: 15 minutes` changes that); it only speaks up when something matters.
+- **Skills it drafts.** After a hard task it can write a skill from what worked. Drafts wait in the Memory
+  drawer; nothing is usable until you approve it.
+
+## Extending itself with MCP tools
+
+When a job needs something it cannot do (a service, a database, a file format), the assistant uses
+`extension`:
+
+1. **find** restates the job, checks the tools already installed first, then searches the marketplaces
+   (awesome-mcp-servers and mcpservers.org) and ranks candidates by meaning, not just keywords.
+2. **install** reads the chosen project's README, takes the launch command it documents (never one the small
+   model wrote), and only accepts servers that run on the bundled `npx` or `uvx`. It asks you for any credential
+   or path it needs, starts the server to check it works, and removes it again if it does not. You approve it.
+3. **use** fills in the tool's arguments under the tool's own input schema, asks you for anything missing instead
+   of guessing, and calls it. The first success is remembered and drafts a skill for next time.
+
+A shipped `find-mcp-tool` skill teaches the same steps. Marketplace listings and tool output are treated as
+untrusted data.

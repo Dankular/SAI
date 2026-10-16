@@ -158,8 +158,12 @@ func (a *app) startMCPClient(ctx context.Context, name string, cfg mcpServerConf
 		}
 		workingDir = resolved
 	}
+	command, err := a.resolveExtensionCommand(cfg.Command)
+	if err != nil {
+		return nil, err
+	}
 	procCtx, cancel := context.WithCancel(a.ctx)
-	cmd := exec.CommandContext(procCtx, cfg.Command, cfg.Args...)
+	cmd := exec.CommandContext(procCtx, command, cfg.Args...)
 	cmd.Dir = workingDir
 	cmd.Env = a.extensionEnvironment(cfg.Env)
 	cmd.WaitDelay = 2 * time.Second
@@ -192,7 +196,7 @@ func (a *app) startMCPClient(ctx context.Context, name string, cfg mcpServerConf
 		}
 	}()
 
-	initCtx, initCancel := context.WithTimeout(ctx, 30*time.Second)
+	initCtx, initCancel := context.WithTimeout(ctx, 150*time.Second) // the first npx or uvx run downloads the package
 	defer initCancel()
 	var initialized struct {
 		ProtocolVersion string `json:"protocolVersion"`
@@ -203,7 +207,11 @@ func (a *app) startMCPClient(ctx context.Context, name string, cfg mcpServerConf
 		"clientInfo":      map[string]any{"name": "sovereign-ai", "version": "1.0"},
 	})
 	if err != nil {
+		detail := strings.TrimSpace(clipText(client.stderr.String(), 500))
 		client.close()
+		if detail != "" {
+			return nil, fmt.Errorf("initialize extension %s: %w (it said: %s)", name, err, detail)
+		}
 		return nil, fmt.Errorf("initialize extension %s: %w", name, err)
 	}
 	if err := json.Unmarshal(result, &initialized); err != nil {
@@ -226,7 +234,7 @@ func (a *app) extensionEnvironment(extra map[string]string) []string {
 	if a.workspaceUserlandReady() {
 		env = a.userlandEnv()
 	} else {
-		env = a.runtimeEnv()
+		env = a.withToolchain(a.runtimeEnv())
 	}
 	for key, value := range extra {
 		if !mcpEnvRE.MatchString(key) || strings.EqualFold(key, "PATH") || strings.EqualFold(key, "SYSTEMROOT") || strings.EqualFold(key, "WINDIR") || strings.EqualFold(key, "COMSPEC") {
@@ -431,6 +439,12 @@ func toolExtension(ctx context.Context, a *app, args map[string]any) (string, er
 	action := strings.ToLower(strings.TrimSpace(argString(args, "action")))
 	name := strings.TrimSpace(argString(args, "server"))
 	switch action {
+	case "find":
+		return a.findMCPTool(ctx, argString(args, "query"), true)
+	case "install":
+		return a.installMCPServer(ctx, args)
+	case "use":
+		return a.useMCPTool(ctx, name, argString(args, "tool"), argString(args, "goal"), argString(args, "context"))
 	case "discover":
 		return a.discoverMCPServers(ctx, argString(args, "query"))
 	case "inspect":
@@ -557,7 +571,7 @@ func toolExtension(ctx context.Context, a *app, args map[string]any) (string, er
 		}
 		return clipText(result, 8000), nil
 	default:
-		return "", errors.New("action must be discover, inspect, list, configure, search, describe, call, or remove")
+		return "", errors.New("action must be find, install, use, discover, inspect, list, configure, search, describe, call, or remove")
 	}
 }
 

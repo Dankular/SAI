@@ -47,6 +47,18 @@ func setupStages() []setupStage {
 			run: func(a *app) error { return a.ensureWorkspaceUserland() },
 		},
 		{
+			label: "Add npx and uvx for extensions", step: "Downloading portable Node.js and uv for extensions",
+			failure: "installing npx and uvx failed", resumable: true,
+			run: func(a *app) error {
+				// Extensions are optional, so a failure here must not stop the install; it is retried
+				// the first time an extension needs it.
+				if err := a.ensureToolchain(); err != nil {
+					a.recordCommandOutput("Could not add npx and uvx yet (continuing): " + err.Error())
+				}
+				return nil
+			},
+		},
+		{
 			label: "Prepare for your graphics card", step: "Downloading the llama.cpp runtime for this GPU",
 			failure: "llama.cpp runtime setup failed", resumable: true,
 			run: func(a *app) error {

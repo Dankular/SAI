@@ -24,6 +24,7 @@ type apiStateSnapshot struct {
 	Runtime  runtimeStatus   `json:"runtime"`
 	Orb      orbSnapshot     `json:"orb"`
 	Work     agentWorkStatus `json:"work"`
+	Notices  []notice        `json:"notices,omitempty"`
 	Revision uint64          `json:"revision,omitempty"`
 }
 
@@ -179,8 +180,9 @@ func (a *app) buildStateSnapshot() apiStateSnapshot {
 			WhistleReady:    a.whistleReady(),
 			StateSavedAtUTC: time.Now().UTC().Format(time.RFC3339),
 		},
-		Orb:  orb,
-		Work: work,
+		Orb:     orb,
+		Work:    work,
+		Notices: a.pendingNotices(),
 	}
 	a.mu.Unlock()
 	return snapshot

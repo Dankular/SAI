@@ -20,6 +20,28 @@ persistent vector store. Source files are in the repository root, one concern pe
 - `skills.go` — `SKILL.md` discovery and loading
 - `memory.go` — persistent semantic search over workspace text, saved conversations and memory events, with a word-match fallback
 - `memory_events.go` — evidence-checked event extraction and the append-only memory event history
+- `memory_meta.go` — what the assistant used and what the user pinned (`brain/salience.json`); feeds ranking, fades with a 90-day half-life
+- `memory_tools.go` — the model's memory tools: `memory_search` (kind/days filters), `memory_get`, `memory_edit` (forget, update, pin)
+- `consolidate.go` — deterministic daily tidy-up: merges duplicate/outdated notes and repeated events, backs up first to `brain/backups`
+- `profile.go` — the evidence-backed "what you have learned about the user" block injected into the system prompt
+- `cron.go` — reminders and unattended scheduled tasks (`schedule` tool, scheduler, notices); `harness.go` handles "remind me …" without the model
+- `memory_api.go` — `/api/memory`, the dashboard's memory drawer (`web/memory.js`): inspect, pin, forget, tidy up
+- `schemas.go` — JSON schemas for the harness's own model calls (event extraction, dreaming, skill drafts); never combined with tools
+- `fact_history.go` — `fact_changed` events keep the old value when a note is corrected, so "what was it before?" has an answer
+- `archive.go` — notes over their prompt budget move to `memory/archive.md` (still searchable) instead of being cut off
+- `heartbeat.go` — every 30 minutes, if `HEARTBEAT.md` has bullets and the assistant is idle, run them; quiet unless something needs attention
+- `dream.go` — once a day while idle, the model proposes note merges/additions; Go applies only those it can ground in events, and logs to `memory/dreams.md`
+- `skill_proposals.go` — drafts a skill after a hard task into `<data>/skill-proposals`; only usable once the user approves it in the Memory drawer
+- `harness_correct.go` — corrections, "what was it before?", and scheduling from any sentence with a repeat phrase
+- `toolchain.go` — bundled portable Node.js (npx) and uv (uvx), pinned by version and SHA-256 under `runtime/tools`; MCP servers and the shell tool get them on PATH, with private caches. Installed by a setup stage, an `installPieces` entry for existing installs, and lazily on first use
+- `mcp_find.go` — `extension action=find`: restates the job (schema-constrained, rejected if off-topic), checks installed tools first, then merges marketplace searches and re-ranks by embedding similarity
+- `mcp_install.go` — `action=install`: reads the README, extracts launch commands in Go (never model-written), refuses installer lines and non-npx/uvx launchers, asks the user for placeholders and credentials, tries each option and rolls back one that does not start
+- `mcp_use.go` — `action=use`: tool arguments decoded under the tool's own input schema, filler removed, missing required values asked for; successes are remembered (`mcp-usage.json`) and draft a skill for approval
+- `builtin_skills.go` — the shipped `find-mcp-tool` skill, written once to the shared skills folder
+- `legacy.go` — cleanup of earlier releases. Inside the app folder (OpenClaw runtime, private Node.js, the Agents-A1 model in any quantisation) things are deleted; outside it (`~\.clawdbot`, `%LOCALAPPDATA%\openclaw`, the global npm package and shims) each item is verified, then *retired* to `<data>etired` and deleted after 14 days, never while an OpenClaw gateway answers, never with `SOVEREIGNAI_KEEP_LEGACY` set
+- `processimage_*.go` — a process's program path; `evictOrphans` (in `supervisor.go`) only stops a leftover server whose program lives inside this install's `runtime` folder, so a second copy of the app can never kill the first one's servers
+
+The system prompt is deliberately stable (no clock, no retrieved memory) so llama-server can reuse its prompt cache; per-turn context goes through `volatileContext`. Unattended work (scheduled tasks, heartbeat) gets `unattendedTools` and a step cap via `turnOptions.AllowTools/MaxSteps`.
 - `state_events.go` — Go-owned work state and the server-sent event stream shared by dashboard tabs
 - `shell_windows.go`, `shell_other.go` — how the `shell` tool starts a command
 - `persona.go` — the workspace files that define the assistant's identity (see below)

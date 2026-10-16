@@ -123,9 +123,15 @@ func main() {
 	resumeSetup := a.resumeSetup
 	a.sup = a.newAppSupervisor()
 	// Anything still listening on our ports belongs to an earlier run that did not exit cleanly.
-	evictOrphans([]int{llamaChatPort, llamaEmbedPort, audioPort}, a.recordCommandOutput)
+	evictOrphans([]int{llamaChatPort, llamaEmbedPort, audioPort}, a.runtimeDir(), a.recordCommandOutput)
 	go a.sup.Run()
 	go a.watchStateChanges()
+	a.startMemoryKeeper()
+	a.startScheduler()
+	a.startHeartbeat()
+	a.startDreamer()
+	a.seedBuiltinSkills()
+	go a.cleanLegacy()
 
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -151,6 +157,7 @@ func main() {
 	mux.HandleFunc("/api/orb", a.handleOrb)
 	mux.HandleFunc("/api/agent/approve", a.handleApprove)
 	mux.HandleFunc("/api/agent/reset", a.handleAgentReset)
+	mux.HandleFunc("/api/memory", a.handleMemory)
 	mux.HandleFunc("/api/voice/chat", a.handleVoiceChat)
 	mux.HandleFunc("/api/voice/tts", a.handleTTS)
 	mux.HandleFunc("/api/voice/turn", a.handleTurn)

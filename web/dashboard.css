@@ -271,3 +271,22 @@ body[data-orb="speaking"]{--hud:#9fd8ff}
 
 .widget-corner{height:32px;padding:0 8px;border-radius:8px;border:1px solid rgba(140,170,255,.25);background:rgba(255,255,255,.05);color:inherit;font:inherit;font-size:12px}
 .widget-corner.hidden{display:none}
+
+/* Memory drawer and reminder toasts */
+.mem-drawer{position:fixed;top:0;right:0;bottom:0;width:min(440px,100vw);z-index:30;overflow-y:auto;padding:22px 20px 40px;background:rgba(10,14,26,.97);color:#e8edf8;border-left:1px solid rgba(140,170,255,.18);box-shadow:-24px 0 60px rgba(2,6,20,.55)}
+.mem-top{display:flex;align-items:center;gap:8px}.mem-top b{flex:1;font:500 11px 'DM Mono',monospace;letter-spacing:1.4px;color:#8fa3c9}
+.mem-note{color:#8fa3c9;font-size:12px;line-height:1.5;margin:10px 0 4px}
+.mem-section{margin-top:20px}.mem-head{display:flex;align-items:center;gap:8px;margin:0 0 8px;font:600 13px Manrope,sans-serif;color:#f4f7ff}
+.mem-count{font:500 10px 'DM Mono',monospace;color:#8fa3c9;border:1px solid rgba(140,170,255,.25);border-radius:999px;padding:1px 7px}
+.mem-row{display:flex;align-items:flex-start;gap:6px;padding:9px 0;border-top:1px solid rgba(140,170,255,.1)}
+.mem-text{flex:1;min-width:0;font-size:13px;line-height:1.45;overflow-wrap:anywhere}.mem-text small{display:block;margin-top:3px;color:#7f8fb0;font-size:11px}
+.mem-dim .mem-text{opacity:.5}.mem-empty{color:#7f8fb0;font-size:12px;margin:4px 0}
+.mem-profile{white-space:pre-wrap;margin:0;font:13px/1.5 'DM Sans',sans-serif;color:#cdd7ee;background:rgba(255,255,255,.04);border-radius:8px;padding:10px 12px}
+.mem-btn{flex:none;border:1px solid rgba(140,170,255,.25);background:transparent;color:#cdd7ee;border-radius:7px;padding:4px 9px;font:500 11px 'DM Sans',sans-serif;cursor:pointer}
+.mem-btn:hover{background:rgba(140,170,255,.12)}
+.mem-toasts{position:fixed;top:16px;right:16px;z-index:40;display:grid;gap:8px;width:min(360px,calc(100vw - 32px))}
+.mem-toast{display:flex;align-items:flex-start;gap:10px;padding:12px 14px;border-radius:12px;background:rgba(14,18,32,.97);border:1px solid rgba(126,240,224,.4);color:#e8edf8;box-shadow:0 14px 40px rgba(2,6,20,.5)}
+.mem-toast-text{flex:1;font-size:13px;line-height:1.45;overflow-wrap:anywhere}
+.hidden.mem-drawer{display:none}
+
+.mem-draft{display:grid;gap:6px;padding:10px 0;border-top:1px solid rgba(140,170,255,.1)}.mem-draft small{color:#7f8fb0;font-size:11px}.mem-actions{display:flex;gap:6px}

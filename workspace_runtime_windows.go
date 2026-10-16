@@ -112,7 +112,7 @@ func (a *app) userlandEnv() []string {
 		filepath.Join(systemRoot, "System32"),
 		systemRoot,
 	}, string(os.PathListSeparator))
-	return []string{
+	return a.withToolchain([]string{
 		"SystemRoot=" + systemRoot,
 		"WINDIR=" + systemRoot,
 		"TEMP=" + a.workspaceUserlandTemp(),
@@ -125,7 +125,7 @@ func (a *app) userlandEnv() []string {
 		"MSYS2_PATH_TYPE=inherit",
 		"SOVEREIGNAI_WORKSPACE=" + a.workspace,
 		"SOVEREIGNAI_ROOT=" + filepath.Join(a.workspaceUserlandDir(), "root"),
-	}
+	})
 }
 
 func (a *app) workspaceShellCommand(ctx context.Context, command, dir string) *exec.Cmd {
